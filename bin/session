@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Session Manager v2 - Blazing fast, zero fat
-# Usage: session [start|stop|kill|status|install]
+# Session Manager v2 - No chmod required
+# Setup: bash [path_to_sessionmanager_file] setup
 
+# Auto-chmod if not executable
+[[ ! -x "$0" ]] && chmod +x "$0" && exec bash "$0" "$@"
+# 
 set -eo pipefail
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,6 +15,10 @@ readonly INSTALL_REGISTRY="$HOME/.config/session-manager/installations"
 # These will be set from config or command line
 SESSION_NAME=""
 CONFIG_FILE=""
+
+# Declare associative arrays that will be loaded from config
+declare -A WINDOW_DIRS
+declare -A WINDOW_COLORS
 
 # Core functions - no fluff
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -42,12 +49,28 @@ get_layout() {
     esac
 }
 
-# Tmux layout applier - surgical precision
+# Tmux layout applier - resilient and robust
 apply_layout() {
     local window="$1"
     local pane_count="$2"
 
     log "Creating $pane_count panes for window $window"
+
+    # Quick check and resize if needed
+    sleep 0.1
+
+    # Check window dimensions - require minimum 20x10 for splits
+    local width=$(tmux display-message -t "$window" -p "#{window_width}")
+    local height=$(tmux display-message -t "$window" -p "#{window_height}")
+
+    if [[ $width -lt 20 || $height -lt 10 ]]; then
+        log "Warning: Window too small (${width}x${height}), resizing..."
+        tmux resize-window -t "$window" -x 80 -y 24 2>/dev/null || true
+        sleep 0.1
+        width=$(tmux display-message -t "$window" -p "#{window_width}")
+        height=$(tmux display-message -t "$window" -p "#{window_height}")
+        log "Window resized to ${width}x${height}"
+    fi
 
     case $pane_count in
         1)
@@ -55,61 +78,89 @@ apply_layout() {
             return 0
             ;;
         2)
-            tmux split-window -h -t "$window" || {
+            # Simple horizontal split, fallback to vertical
+            if ! tmux split-window -h -t "$window" 2>/dev/null; then
                 log "Fallback: using vertical split for 2 panes"
                 tmux split-window -v -t "$window" || return 1
-            }
+            fi
             ;;
         3)
-            # 3 panes: Left 50% | Right top 25% | Right bottom 25%
-            tmux resize-window -x 120 -y 40 -t "$window" 2>/dev/null || true
+            # 3-pane layout: Left 50% | Right split 50%/50%
+            log "Creating 3 panes: Left 50%, Right top 50%, Right bottom 50%"
 
-            if ! tmux split-window -h -t "$window" 2>/dev/null; then
-                log "Terminal too small, using vertical splits for 3 panes"
-                tmux split-window -v -t "$window" || return 1
-                tmux split-window -v -t "$window.1" || return 1
+            # Split horizontally first (left | right)
+            if tmux split-window -h -t "$window" 2>/dev/null; then
+                sleep 0.05
+                # Split right pane vertically (top | bottom)
+                if tmux split-window -v -t "$window.1" 2>/dev/null; then
+                    sleep 0.05
+                    # Optimize space allocation accounting for borders
+                    tmux resize-pane -t "$window.0" -x 50% 2>/dev/null || true
+                    sleep 0.02
+                    # Force exact 50/50 split on right panes
+                    tmux resize-pane -t "$window.1" -y 50% 2>/dev/null || true
+                    tmux resize-pane -t "$window.2" -y 50% 2>/dev/null || true
+                    # Final adjustment to maximize space usage
+                    tmux resize-pane -t "$window.2" -D 10 2>/dev/null || true
+                    tmux resize-pane -t "$window.2" -U 10 2>/dev/null || true
+                    log "Applied 3-pane layout: Left 50%, Right 50%/50%"
+                else
+                    log "Warning: Failed to split right pane, falling back to horizontal split"
+                fi
             else
+                # Fallback: vertical splits if terminal too narrow
+                log "Terminal too narrow, using vertical splits for 3 panes"
+                tmux split-window -v -t "$window" 2>/dev/null || return 1
                 sleep 0.2
-                # Split right pane vertically (top/bottom)
-                tmux split-window -v -t "$window.1" || return 1
-                # Resize: left pane 50%, right panes 25% each
-                tmux resize-pane -t "$window.0" -x 50% 2>/dev/null || true
-                tmux resize-pane -t "$window.1" -y 50% 2>/dev/null || true
-                tmux resize-pane -t "$window.2" -y 50% 2>/dev/null || true
+                tmux split-window -v -t "$window" 2>/dev/null || return 1
             fi
             ;;
         4)
-            # 4 panes: 25% each in a 2x2 grid
-            tmux resize-window -x 160 -y 50 -t "$window" 2>/dev/null || true
+            # Resilient 4-pane layout: incremental splits then tiled
+            log "Creating 4 panes using incremental approach"
+            # Create all panes with simple vertical splits first
+            for ((i=1; i<4; i++)); do
+                if tmux split-window -v -t "$window" 2>/dev/null; then
+                    log "Created pane $i"
+                    sleep 0.2
+                else
+                    log "Warning: Failed to create pane $i"
+                    break
+                fi
+            done
 
-            if ! tmux split-window -h -t "$window" 2>/dev/null; then
-                log "Terminal too small, using simple vertical layout for 4 panes"
-                for ((i=1; i<4; i++)); do
-                    tmux split-window -v -t "$window" || return 1
-                done
-            else
-                sleep 0.2
-                # Create 2x2 grid: split horizontally first (50/50)
-                tmux split-window -v -t "$window.0" || return 1  # Split left pane
-                sleep 0.2
-                tmux split-window -v -t "$window.1" || return 1  # Split right pane
-
-                # Now we have 4 panes in 2x2 grid, resize for even distribution
+            # Apply tiled layout for 2x2 grid with space optimization
+            sleep 0.1
+            if tmux select-layout -t "$window" tiled 2>/dev/null; then
+                log "Applied tiled layout successfully"
+                # Fine-tune pane sizes to maximize space usage
+                sleep 0.02
                 tmux resize-pane -t "$window.0" -x 50% -y 50% 2>/dev/null || true
                 tmux resize-pane -t "$window.1" -x 50% -y 50% 2>/dev/null || true
                 tmux resize-pane -t "$window.2" -x 50% -y 50% 2>/dev/null || true
                 tmux resize-pane -t "$window.3" -x 50% -y 50% 2>/dev/null || true
+            else
+                log "Warning: Could not apply tiled layout, using even-vertical"
+                tmux select-layout -t "$window" even-vertical 2>/dev/null || true
             fi
             ;;
         *)
-            log "Using tmux's tiled layout for $pane_count panes"
+            log "Using incremental splits for $pane_count panes"
             for ((i=1; i<pane_count; i++)); do
-                tmux split-window -v -t "$window" || return 1
-                sleep 0.1
+                if tmux split-window -v -t "$window" 2>/dev/null; then
+                    sleep 0.1
+                else
+                    log "Warning: Could only create $i panes out of $pane_count"
+                    break
+                fi
             done
             tmux select-layout -t "$window" tiled 2>/dev/null || true
             ;;
     esac
+
+    # Final verification
+    local actual_panes=$(tmux list-panes -t "$window" | wc -l)
+    log "Window $window: requested $pane_count panes, created $actual_panes panes"
 
     return 0
 }
@@ -131,30 +182,49 @@ execute_pane() {
     fi
 
     if [[ -n "$session_name" ]]; then
-        # Create subsession if needed
-        if ! tmux has-session -t "$session_name" 2>/dev/null; then
-            local window_name="${window##*:}"  # Extract window name from session:window format
-            local window_dir="${WINDOW_DIR[$window_name]:-$PWD}"
-            log "Creating subsession '$session_name' in directory '$window_dir'"
+        local subsession_existed=false
 
-            if ! tmux new-session -d -s "$session_name" -c "$window_dir"; then
+        # Check if subsession already exists
+        if tmux has-session -t "$session_name" 2>/dev/null; then
+            log "Subsession '$session_name' already exists, reusing..."
+            subsession_existed=true
+        else
+            # Create new subsession
+            local window_name="${window##*:}"  # Extract window name from session:window format
+            local window_dir="${WINDOW_DIRS[$window_name]:-$PWD}"
+            log "Creating new subsession '$session_name' in directory '$window_dir'"
+
+            # Create subsession in background for speed
+            if ! tmux new-session -d -s "$session_name" -c "$window_dir" 2>/dev/null; then
                 log "Error: Failed to create subsession $session_name"
                 return 1
             fi
-        fi
 
-        # Send command to subsession if provided
-        if [[ -n "$cmd" ]]; then
-            log "Sending command to subsession $session_name: $cmd"
-            if ! tmux send-keys -t "$session_name" "$cmd" Enter; then
-                log "Warning: Failed to send command to subsession $session_name"
+            # Apply window color scheme to subsession
+            local subsession_color="${WINDOW_COLORS[$window_name]:-}"
+            if [[ -n "$subsession_color" ]]; then
+                # Apply color as text color for entire status bar
+                tmux set-option -t "$session_name" status-style "fg=${subsession_color},bg=default"
+                tmux set-option -t "$session_name" status-left "#[fg=${subsession_color},bold] #S #[default]"
+                tmux set-option -t "$session_name" status-right "#[fg=${subsession_color}] #(/tmp/et-time.sh) #(TZ=UTC date \"+[%H:%M UTC]\") #[default]"
+                log "Applied color $subsession_color to subsession $session_name status bar text"
             fi
         fi
 
-        # Link pane to subsession
-        log "Linking pane $target to subsession $session_name"
+        # Send command to subsession if provided (only for new subsessions)
+        if [[ -n "$cmd" ]] && [[ "$subsession_existed" == "false" ]]; then
+            log "Sending command to new subsession $session_name: $cmd"
+            if ! tmux send-keys -t "$session_name" "$cmd" Enter; then
+                log "Warning: Failed to send command to subsession $session_name"
+            fi
+        elif [[ "$subsession_existed" == "true" ]]; then
+            log "Skipping command for existing subsession $session_name"
+        fi
+
+        # Attach to subsession using subsession method
+        log "Attaching pane $target to subsession $session_name"
         if ! tmux send-keys -t "$target" "TMUX= tmux attach-session -t $session_name || exec bash" Enter; then
-            log "Error: Failed to link pane to subsession"
+            log "Error: Failed to attach pane to subsession"
             return 1
         fi
     else
@@ -225,11 +295,11 @@ set -g status-interval 1
 set -g status-left-length 50
 set -g status-right-length 100
 
-# Time display: ET time [UTC time]
-set -g status-right '#(TZ="America/New_York" date "+%H:%M ET") #(TZ="UTC" date "+[%H:%M UTC]")'
-set -g status-left "#[fg=white,bg=black] #S "
+# Time display: Eastern time [UTC time]
+set -g status-right '#(/tmp/et-time.sh) #(TZ=UTC date "+[%H:%M UTC]")'
+# Note: status-left and status colors will be set by session manager
 
-# Base colors
+# Default status colors (will be overridden by session manager)
 set -g status-bg black
 set -g status-fg white
 
@@ -274,9 +344,25 @@ start_session() {
     detect_project_structure
     create_tmux_config
 
-    # Check if session already exists
+    # Check if session already exists and handle subsessions intelligently
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         log "Session $SESSION_NAME already exists, attaching..."
+
+        # Check if subsessions are still running and log status
+        local existing_subsessions=()
+        for window in "${WINDOWS[@]:-}"; do
+            local -n sessions_ref="${window^^}_SESSIONS" 2>/dev/null || continue
+            for session_name in "${sessions_ref[@]}"; do
+                if [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
+                    existing_subsessions+=("$session_name")
+                fi
+            done
+        done 2>/dev/null
+
+        if [[ ${#existing_subsessions[@]} -gt 0 ]]; then
+            log "Found existing subsessions: ${existing_subsessions[*]}"
+        fi
+
         exec tmux attach-session -t "$SESSION_NAME"
     fi
 
@@ -291,9 +377,21 @@ start_session() {
     # Create main session with custom config
     tmux -f /tmp/session-tmux.conf new-session -d -s "$SESSION_NAME"
 
-    # Set master session color if defined
+    # Set master session color scheme if defined
     if [[ -n "${SESSION_COLOR:-}" ]]; then
+        # Give tmux time to fully initialize
+        sleep 0.1
+        # Clear any global status overrides first
+        tmux set-option -g status-style "default"
+        # Set full status bar background to session color
         tmux set-option -t "$SESSION_NAME" status-style "fg=white,bg=${SESSION_COLOR}"
+        # Session name with extra padding and session color background
+        tmux set-option -t "$SESSION_NAME" status-left "#[fg=white,bg=${SESSION_COLOR},bold]  #S  #[default]   "
+        # Time display with session color background
+        tmux set-option -t "$SESSION_NAME" status-right "#[fg=white,bg=${SESSION_COLOR}] #(/tmp/et-time.sh) #(TZ=UTC date \"+[%H:%M UTC]\") #[default]"
+        # Center window names in status bar
+        tmux set-option -t "$SESSION_NAME" status-justify centre
+        log "Applied session color scheme $SESSION_COLOR to master session status bar"
     fi
 
     local first_window=true
@@ -317,9 +415,11 @@ start_session() {
         local window_color="${WINDOW_COLORS[$window]:-}"
         if [[ -n "$window_color" ]]; then
             sleep 0.2  # Wait for layout to settle
-            tmux set-window-option -t "$SESSION_NAME:$window" window-status-current-style "fg=black,bg=$window_color"
-            tmux set-window-option -t "$SESSION_NAME:$window" window-status-style "fg=white,bg=$window_color"
-            log "Applied color $window_color to window $window"
+            # Active window: full colored background with black text
+            tmux set-window-option -t "$SESSION_NAME:$window" window-status-current-style "fg=black,bg=$window_color,bold"
+            # Inactive windows: colored text on default background (muted)
+            tmux set-window-option -t "$SESSION_NAME:$window" window-status-style "fg=$window_color,bg=default"
+            log "Applied color $window_color to window $window tab (active=background, inactive=text)"
         fi
 
         # Get pane arrays for this window
@@ -363,21 +463,31 @@ start_session() {
 
 # Status checker - instant feedback
 show_status() {
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-        echo "✓ Main session: $SESSION_NAME (running)"
+    # Load config to get SESSION_NAME and subsession info
+    if source "$CONFIG_FILE" 2>/dev/null; then
+        if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+            echo "✓ Main session: $SESSION_NAME (running)"
 
-        # List subsessions
-        local subsessions
-        subsessions=$(tmux list-sessions 2>/dev/null | grep -v "^$SESSION_NAME:" | cut -d: -f1 || true)
-
-        if [[ -n "$subsessions" ]]; then
-            echo "✓ Subsessions:"
-            echo "$subsessions" | while read -r session; do
-                echo "  - $session"
+            # List subsessions from config (like stop_session does)
+            local subsessions=()
+            for window in "${WINDOWS[@]}"; do
+                local -n sessions_ref="${window^^}_SESSIONS"
+                for session_name in "${sessions_ref[@]}"; do
+                    if [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
+                        subsessions+=("$session_name")
+                    fi
+                done
             done
+
+            if [[ ${#subsessions[@]} -gt 0 ]]; then
+                echo "✓ Subsessions:"
+                printf "  - %s\n" "${subsessions[@]}"
+            fi
+        else
+            echo "✗ Session not running"
         fi
     else
-        echo "✗ Session not running"
+        echo "✗ Failed to load config"
     fi
 }
 
@@ -506,6 +616,7 @@ install_session() {
 # Generated: $(date)
 
 CONFIG_FILE="$config_full_path"
+export CONFIG_FILE
 
 case "\${1:-start}" in
     "start"|"")
