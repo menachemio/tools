@@ -2,9 +2,19 @@
 # Session Manager v2 - No chmod required
 # Setup: bash [path_to_sessionmanager_file] setup
 
+# IMPORTANT: UTF-8 Fix for tmux border characters
+# If tmux borders display as 'qqqqq' or 'xxxxx' instead of clean lines,
+# you need to set UTF-8 locale in your shell profile (~/.bashrc or ~/.zshrc):
+#
+#   export LANG=C.UTF-8
+#   export LC_ALL=C.UTF-8
+#
+# Then logout/login or source your profile.
+# NOTE: The tmux -u flag does NOT fix this issue - proper locale is required.
+
 # Auto-chmod if not executable
 [[ ! -x "$0" ]] && chmod +x "$0" && exec bash "$0" "$@"
-# 
+#
 set -eo pipefail
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,8 +23,8 @@ readonly INSTALL_DIR="$HOME/.local/bin"
 readonly INSTALL_REGISTRY="$HOME/.config/session-manager/installations"
 
 # These will be set from config or command line
-SESSION_NAME=""
-CONFIG_FILE=""
+SESSION_NAME="${SESSION_NAME:-}"
+CONFIG_FILE="${CONFIG_FILE:-}"
 
 # Declare associative arrays that will be loaded from config
 declare -A WINDOW_DIRS
@@ -23,6 +33,65 @@ declare -A WINDOW_COLORS
 # Core functions - no fluff
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "INFO: $*" >&2; }
+
+# Helper functions - DRY principle
+session_exists() {
+    tmux has-session -t "$1" 2>/dev/null
+}
+
+# Create session-specific timezone script from config
+create_timezone_script() {
+    local script="/tmp/${SESSION_NAME}-time.sh"
+    local primary_tz="${SESSION_TIMEZONE:-America/New_York}"
+    local show_utc="${SHOW_UTC:-true}"
+
+    cat > "$script" << EOF
+#!/bin/bash
+# Generated timezone script for session: $SESSION_NAME
+# Primary timezone: $primary_tz
+# Show UTC: $show_utc
+
+primary_time=\$(TZ="$primary_tz" date "+%H:%M %Z")
+
+EOF
+
+    if [[ "$show_utc" == "true" ]]; then
+        cat >> "$script" << 'EOF'
+utc_time=$(TZ=UTC date "+[%H:%M UTC]")
+echo "$primary_time $utc_time"
+EOF
+    else
+        cat >> "$script" << 'EOF'
+echo "$primary_time"
+EOF
+    fi
+
+    chmod +x "$script"
+    echo "$script"  # Return the script path
+}
+
+# Get all running subsessions from current config
+get_running_subsessions() {
+    local subsessions=()
+    for window in "${WINDOWS[@]:-}"; do
+        local -n sessions_ref="${window^^}_SESSIONS" 2>/dev/null || continue
+        for session_name in "${sessions_ref[@]}"; do
+            if [[ -n "$session_name" ]] && session_exists "$session_name"; then
+                subsessions+=("$session_name")
+            fi
+        done
+    done 2>/dev/null
+    echo "${subsessions[@]}"
+}
+
+# Iterate through registry file
+iter_registry() {
+    [[ -f "$INSTALL_REGISTRY" ]] || return 1
+    while IFS=: read -r name config_path install_date; do
+        echo "$name:$config_path:$install_date"
+    done < "$INSTALL_REGISTRY"
+}
+
 
 # Lightning-fast config loader - zero parsing overhead
 load_config() {
@@ -53,6 +122,7 @@ get_layout() {
 apply_layout() {
     local window="$1"
     local pane_count="$2"
+    local window_dir="$3"
 
     log "Creating $pane_count panes for window $window"
 
@@ -78,76 +148,38 @@ apply_layout() {
             return 0
             ;;
         2)
-            # Simple horizontal split, fallback to vertical
-            if ! tmux split-window -h -t "$window" 2>/dev/null; then
-                log "Fallback: using vertical split for 2 panes"
-                tmux split-window -v -t "$window" || return 1
-            fi
+            # Simple horizontal split
+            tmux split-window -h -t "$window" -c "$window_dir" || return 1
             ;;
         3)
-            # 3-pane layout: Left 50% | Right split 50%/50%
-            log "Creating 3 panes: Left 50%, Right top 50%, Right bottom 50%"
+            # 3-pane layout: Left pane | Right split vertically
+            log "Creating 3 panes"
 
             # Split horizontally first (left | right)
-            if tmux split-window -h -t "$window" 2>/dev/null; then
-                sleep 0.05
-                # Split right pane vertically (top | bottom)
-                if tmux split-window -v -t "$window.1" 2>/dev/null; then
-                    sleep 0.05
-                    # Optimize space allocation accounting for borders
-                    tmux resize-pane -t "$window.0" -x 50% 2>/dev/null || true
-                    sleep 0.02
-                    # Force exact 50/50 split on right panes
-                    tmux resize-pane -t "$window.1" -y 50% 2>/dev/null || true
-                    tmux resize-pane -t "$window.2" -y 50% 2>/dev/null || true
-                    # Final adjustment to maximize space usage
-                    tmux resize-pane -t "$window.2" -D 10 2>/dev/null || true
-                    tmux resize-pane -t "$window.2" -U 10 2>/dev/null || true
-                    log "Applied 3-pane layout: Left 50%, Right 50%/50%"
-                else
-                    log "Warning: Failed to split right pane, falling back to horizontal split"
-                fi
-            else
-                # Fallback: vertical splits if terminal too narrow
-                log "Terminal too narrow, using vertical splits for 3 panes"
-                tmux split-window -v -t "$window" 2>/dev/null || return 1
-                sleep 0.2
-                tmux split-window -v -t "$window" 2>/dev/null || return 1
-            fi
+            tmux split-window -h -t "$window" -c "$window_dir" || return 1
+            # Split right pane vertically (top | bottom)
+            tmux split-window -v -t "$window.1" -c "$window_dir" || return 1
+
+            log "Applied 3-pane layout"
             ;;
         4)
-            # Resilient 4-pane layout: incremental splits then tiled
-            log "Creating 4 panes using incremental approach"
-            # Create all panes with simple vertical splits first
-            for ((i=1; i<4; i++)); do
-                if tmux split-window -v -t "$window" 2>/dev/null; then
-                    log "Created pane $i"
-                    sleep 0.2
-                else
-                    log "Warning: Failed to create pane $i"
-                    break
-                fi
-            done
+            # 4-pane layout: Create panes and apply tiled layout
+            log "Creating 4 panes"
 
-            # Apply tiled layout for 2x2 grid with space optimization
-            sleep 0.1
-            if tmux select-layout -t "$window" tiled 2>/dev/null; then
-                log "Applied tiled layout successfully"
-                # Fine-tune pane sizes to maximize space usage
-                sleep 0.02
-                tmux resize-pane -t "$window.0" -x 50% -y 50% 2>/dev/null || true
-                tmux resize-pane -t "$window.1" -x 50% -y 50% 2>/dev/null || true
-                tmux resize-pane -t "$window.2" -x 50% -y 50% 2>/dev/null || true
-                tmux resize-pane -t "$window.3" -x 50% -y 50% 2>/dev/null || true
-            else
-                log "Warning: Could not apply tiled layout, using even-vertical"
-                tmux select-layout -t "$window" even-vertical 2>/dev/null || true
-            fi
+            # Create 4 panes
+            tmux split-window -v -t "$window" -c "$window_dir" || return 1
+            tmux split-window -h -t "$window.0" -c "$window_dir" || return 1
+            tmux split-window -h -t "$window.2" -c "$window_dir" || return 1
+
+            # Apply tiled layout for 2x2 grid
+            tmux select-layout -t "$window" tiled || return 1
+
+            log "Applied 4-pane tiled layout"
             ;;
         *)
             log "Using incremental splits for $pane_count panes"
             for ((i=1; i<pane_count; i++)); do
-                if tmux split-window -v -t "$window" 2>/dev/null; then
+                if tmux split-window -v -t "$window" -c "$window_dir" 2>/dev/null; then
                     sleep 0.1
                 else
                     log "Warning: Could only create $i panes out of $pane_count"
@@ -165,79 +197,67 @@ apply_layout() {
     return 0
 }
 
-# Pane executor - no mercy
-execute_pane() {
+# Execute direct command in pane (Phase 1)
+execute_direct_command() {
+    local window="$1"
+    local pane_index="$2"
+    local cmd="$3"
+    local target="$window.$pane_index"
+
+    [[ "$cmd" != "nvim" ]] && log "Executing direct command in pane $target: '$cmd'"
+
+    # Quick pane verification (optimized)
+    if ! tmux list-panes -t "$window" -F "#{pane_index}" | grep -q "^$pane_index$"; then
+        log "Error: Pane $pane_index does not exist in window $window"
+        return 1
+    fi
+
+    if [[ -n "$cmd" ]]; then
+        if ! tmux send-keys -t "$target" "$cmd" Enter; then
+            log "Error: Failed to send command to pane"
+            return 1
+        fi
+    else
+        log "No command specified for pane $target"
+    fi
+
+    return 0
+}
+
+# Attach pane to existing subsession (Phase 2)
+attach_to_subsession() {
     local window="$1"
     local pane_index="$2"
     local cmd="$3"
     local session_name="$4"
     local target="$window.$pane_index"
 
-    log "Executing in pane $target: cmd='$cmd', session='$session_name'"
+    log "Attaching pane $target to subsession '$session_name'"
 
-    # Verify pane exists
-    if ! tmux list-panes -t "$window" | grep -q "^$pane_index:"; then
+    # Quick pane verification (optimized)
+    if ! tmux list-panes -t "$window" -F "#{pane_index}" | grep -q "^$pane_index$"; then
         log "Error: Pane $pane_index does not exist in window $window"
         return 1
     fi
 
-    if [[ -n "$session_name" ]]; then
-        local subsession_existed=false
+    # Subsession must exist from pre-creation
+    if ! session_exists "$session_name"; then
+        log "Error: Subsession $session_name does not exist (pre-creation failed)"
+        return 1
+    fi
 
-        # Check if subsession already exists
-        if tmux has-session -t "$session_name" 2>/dev/null; then
-            log "Subsession '$session_name' already exists, reusing..."
-            subsession_existed=true
-        else
-            # Create new subsession
-            local window_name="${window##*:}"  # Extract window name from session:window format
-            local window_dir="${WINDOW_DIRS[$window_name]:-$PWD}"
-            log "Creating new subsession '$session_name' in directory '$window_dir'"
-
-            # Create subsession in background for speed
-            if ! tmux new-session -d -s "$session_name" -c "$window_dir" 2>/dev/null; then
-                log "Error: Failed to create subsession $session_name"
-                return 1
-            fi
-
-            # Apply window color scheme to subsession
-            local subsession_color="${WINDOW_COLORS[$window_name]:-}"
-            if [[ -n "$subsession_color" ]]; then
-                # Apply color as text color for entire status bar
-                tmux set-option -t "$session_name" status-style "fg=${subsession_color},bg=default"
-                tmux set-option -t "$session_name" status-left "#[fg=${subsession_color},bold] #S #[default]"
-                tmux set-option -t "$session_name" status-right "#[fg=${subsession_color}] #(/tmp/et-time.sh) #(TZ=UTC date \"+[%H:%M UTC]\") #[default]"
-                log "Applied color $subsession_color to subsession $session_name status bar text"
-            fi
+    # Send command to subsession if provided
+    if [[ -n "$cmd" ]]; then
+        log "Sending command to subsession $session_name: '$cmd'"
+        if ! tmux send-keys -t "$session_name" "$cmd" Enter; then
+            log "Warning: Failed to send command to subsession $session_name"
         fi
+    fi
 
-        # Send command to subsession if provided (only for new subsessions)
-        if [[ -n "$cmd" ]] && [[ "$subsession_existed" == "false" ]]; then
-            log "Sending command to new subsession $session_name: $cmd"
-            if ! tmux send-keys -t "$session_name" "$cmd" Enter; then
-                log "Warning: Failed to send command to subsession $session_name"
-            fi
-        elif [[ "$subsession_existed" == "true" ]]; then
-            log "Skipping command for existing subsession $session_name"
-        fi
-
-        # Attach to subsession using subsession method
-        log "Attaching pane $target to subsession $session_name"
-        if ! tmux send-keys -t "$target" "TMUX= tmux attach-session -t $session_name || exec bash" Enter; then
-            log "Error: Failed to attach pane to subsession"
-            return 1
-        fi
-    else
-        # Direct command execution
-        if [[ -n "$cmd" ]]; then
-            log "Sending direct command to pane $target: $cmd"
-            if ! tmux send-keys -t "$target" "$cmd" Enter; then
-                log "Error: Failed to send command to pane"
-                return 1
-            fi
-        else
-            log "No command specified for pane $target"
-        fi
+    # Attach to subsession
+    if ! tmux send-keys -t "$target" " TMUX= tmux attach-session -t $session_name || exec bash" Enter; then
+        log "Error: Failed to attach pane to subsession"
+        return 1
     fi
 
     return 0
@@ -280,7 +300,8 @@ detect_project_structure() {
 
 # Create tmux configuration
 create_tmux_config() {
-    cat > /tmp/session-tmux.conf << 'EOF'
+    local timezone_script="$1"
+    cat > /tmp/session-tmux.conf << EOF
 # Session Manager tmux configuration
 set -g default-terminal "tmux-256color"
 set -ga terminal-overrides ",*256col*:Tc"
@@ -295,8 +316,8 @@ set -g status-interval 1
 set -g status-left-length 50
 set -g status-right-length 100
 
-# Time display: Eastern time [UTC time]
-set -g status-right '#(/tmp/et-time.sh) #(TZ=UTC date "+[%H:%M UTC]")'
+# Time display: configured timezone
+set -g status-right '#($timezone_script)'
 # Note: status-left and status colors will be set by session manager
 
 # Default status colors (will be overridden by session manager)
@@ -315,10 +336,18 @@ bind -n M-j select-pane -D
 bind -n M-k select-pane -U
 bind -n M-l select-pane -R
 
-# Window navigation - Alt+1/2/3 (tmux windows start at 1)
-bind -n M-1 select-window -t 1
-bind -n M-2 select-window -t 2
-bind -n M-3 select-window -t 3
+# Window navigation - Alt+1 through Alt+N (dynamic based on window count)
+EOF
+
+    # Generate dynamic window bindings (Alt+1 through Alt+N, max 20 for practicality)
+    local window_count=${#WINDOWS[@]}
+    local max_bindings=$((window_count > 20 ? 20 : window_count))
+
+    for ((i=1; i<=max_bindings; i++)); do
+        echo "bind -n M-$i select-window -t $i" >> /tmp/session-tmux.conf
+    done
+
+    cat >> /tmp/session-tmux.conf << 'EOF'
 
 # Quick window switching - Alt+n/p
 bind -n M-n next-window
@@ -337,182 +366,231 @@ EOF
 
 # Main session builder - Gordon Ramsay speed
 start_session() {
-    log "Starting development environment..."
+    local headless_mode=false
+    if [[ "$1" == "--headless" ]]; then
+        headless_mode=true
+        log "Starting development environment in headless mode..."
+    else
+        log "Starting development environment..."
+    fi
 
     check_dependencies
     load_config
+    TIMEZONE_SCRIPT=$(create_timezone_script)  # Make it global
     detect_project_structure
-    create_tmux_config
+    create_tmux_config "$TIMEZONE_SCRIPT"
+
+    local skip_session_creation=false
 
     # Check if session already exists and handle subsessions intelligently
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-        log "Session $SESSION_NAME already exists, attaching..."
+    if session_exists "$SESSION_NAME"; then
+        log "Session $SESSION_NAME already exists"
 
         # Check if subsessions are still running and log status
-        local existing_subsessions=()
-        for window in "${WINDOWS[@]:-}"; do
-            local -n sessions_ref="${window^^}_SESSIONS" 2>/dev/null || continue
-            for session_name in "${sessions_ref[@]}"; do
-                if [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
-                    existing_subsessions+=("$session_name")
-                fi
-            done
-        done 2>/dev/null
+        local existing_subsessions=($(get_running_subsessions))
 
         if [[ ${#existing_subsessions[@]} -gt 0 ]]; then
             log "Found existing subsessions: ${existing_subsessions[*]}"
         fi
 
-        exec tmux attach-session -t "$SESSION_NAME"
+        skip_session_creation=true
     fi
 
-    log "Creating new session: $SESSION_NAME"
+    if [[ "$skip_session_creation" == "false" ]]; then
+        log "Creating new session: $SESSION_NAME"
 
-    # Load config - instant!
-    load_config
+        # Kill existing session silently
+        tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 
-    # Kill existing session silently
-    tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+        # Create main session with custom config
+        tmux -f /tmp/session-tmux.conf new-session -d -s "$SESSION_NAME"
 
-    # Create main session with custom config
-    tmux -f /tmp/session-tmux.conf new-session -d -s "$SESSION_NAME"
+        # Unset window-size option early to ensure proper layout calculations
+        tmux set-option -u window-size 2>/dev/null || true
 
-    # Set master session color scheme if defined
-    if [[ -n "${SESSION_COLOR:-}" ]]; then
-        # Give tmux time to fully initialize
-        sleep 0.1
-        # Clear any global status overrides first
-        tmux set-option -g status-style "default"
-        # Set full status bar background to session color
-        tmux set-option -t "$SESSION_NAME" status-style "fg=white,bg=${SESSION_COLOR}"
-        # Session name with extra padding and session color background
-        tmux set-option -t "$SESSION_NAME" status-left "#[fg=white,bg=${SESSION_COLOR},bold]  #S  #[default]   "
-        # Time display with session color background
-        tmux set-option -t "$SESSION_NAME" status-right "#[fg=white,bg=${SESSION_COLOR}] #(/tmp/et-time.sh) #(TZ=UTC date \"+[%H:%M UTC]\") #[default]"
-        # Center window names in status bar
-        tmux set-option -t "$SESSION_NAME" status-justify centre
-        log "Applied session color scheme $SESSION_COLOR to master session status bar"
-    fi
-
-    local first_window=true
-    for window in "${WINDOWS[@]}"; do
-        local window_dir="${WINDOW_DIRS[$window]:-$PWD}"
-
-        log "Setting up window: $window in $window_dir"
-
-        # Create or rename window
-        if $first_window; then
-            tmux rename-window -t "$SESSION_NAME" "$window"
-            first_window=false
-        else
-            tmux new-window -t "$SESSION_NAME" -n "$window"
+        # Set master session color scheme if defined
+        if [[ -n "${SESSION_COLOR:-}" ]]; then
+            # Give tmux time to fully initialize
+            sleep 0.1
+            # Clear any global status overrides first
+            tmux set-option -g status-style "default"
+            # Set full status bar background to session color
+            tmux set-option -t "$SESSION_NAME" status-style "fg=white,bg=${SESSION_COLOR}"
+            # Session name with extra padding and session color background
+            tmux set-option -t "$SESSION_NAME" status-left "#[fg=white,bg=${SESSION_COLOR},bold]  #S  #[default]   "
+            # Time display with session color background
+            tmux set-option -t "$SESSION_NAME" status-right "#[fg=white,bg=${SESSION_COLOR}] #($TIMEZONE_SCRIPT) #[default]"
+            # Center window names in status bar
+            tmux set-option -t "$SESSION_NAME" status-justify centre
+            log "Applied session color scheme $SESSION_COLOR to master session status bar"
         fi
 
-        # Set working directory
-        tmux send-keys -t "$SESSION_NAME:$window" "cd '$window_dir'" Enter
+        # Pre-create all subsessions to avoid race conditions with window sizing
+        log "Pre-creating subsessions..."
+        for window in "${WINDOWS[@]}"; do
+            local window_dir="${WINDOW_DIRS[$window]:-$PWD}"
+            local -n sessions_ref="${window^^}_SESSIONS"
 
-        # Set window color if defined (after layout is applied)
-        local window_color="${WINDOW_COLORS[$window]:-}"
-        if [[ -n "$window_color" ]]; then
-            sleep 0.2  # Wait for layout to settle
-            # Active window: full colored background with black text
-            tmux set-window-option -t "$SESSION_NAME:$window" window-status-current-style "fg=black,bg=$window_color,bold"
-            # Inactive windows: colored text on default background (muted)
-            tmux set-window-option -t "$SESSION_NAME:$window" window-status-style "fg=$window_color,bg=default"
-            log "Applied color $window_color to window $window tab (active=background, inactive=text)"
-        fi
+            for session_name in "${sessions_ref[@]}"; do
+                if [[ -n "$session_name" ]] && ! session_exists "$session_name"; then
+                    log "Pre-creating subsession: $session_name in $window_dir"
+                    tmux new-session -d -s "$session_name" -c "$window_dir" 2>/dev/null || {
+                        log "Warning: Failed to pre-create subsession $session_name"
+                        continue
+                    }
 
-        # Get pane arrays for this window
-        local -n panes_ref="${window^^}_PANES"
-        local -n sessions_ref="${window^^}_SESSIONS"
-        local pane_count=${#panes_ref[@]}
 
-        log "Window $window has $pane_count panes"
+                    # Apply color scheme to new subsession
+                    local subsession_color="${WINDOW_COLORS[$window]:-}"
+                    if [[ -n "$subsession_color" ]]; then
+                        tmux set-option -t "$session_name" status-style "fg=${subsession_color},bg=default"
+                        tmux set-option -t "$session_name" status-left "#[fg=${subsession_color},bold] #S #[default]"
+                        tmux set-option -t "$session_name" status-right "#[fg=${subsession_color}] #($TIMEZONE_SCRIPT) #[default]"
+                    fi
+                fi
+            done
+        done
 
-        # Apply layout
-        if ! apply_layout "$SESSION_NAME:$window" "$pane_count"; then
-            log "Warning: Layout application failed for $window"
-            continue
-        fi
+        local first_window=true
+        for window in "${WINDOWS[@]}"; do
+            local window_dir="${WINDOW_DIRS[$window]:-$PWD}"
 
-        # Give tmux time to settle
-        sleep 0.5
+            log "Setting up window: $window in $window_dir"
 
-        # Execute pane commands
-        for ((i=0; i<pane_count; i++)); do
-            local cmd="${panes_ref[$i]}"
-            local session_name="${sessions_ref[$i]}"
-
-            log "Pane $i: cmd='$cmd', session='$session_name'"
-
-            if ! execute_pane "$SESSION_NAME:$window" "$i" "$cmd" "$session_name"; then
-                log "Warning: Failed to execute in pane $i"
+            # Create or rename window
+            if $first_window; then
+                tmux rename-window -t "$SESSION_NAME" "$window"
+                first_window=false
+            else
+                tmux new-window -t "$SESSION_NAME" -n "$window"
             fi
 
-            sleep 0.2
+            # Set working directory
+            tmux send-keys -t "$SESSION_NAME:$window" "cd '$window_dir'" Enter
+
+            # Set window color if defined (after layout is applied)
+            local window_color="${WINDOW_COLORS[$window]:-}"
+            if [[ -n "$window_color" ]]; then
+                # Active window: full colored background with black text
+                tmux set-window-option -t "$SESSION_NAME:$window" window-status-current-style "fg=black,bg=$window_color,bold"
+                # Inactive windows: colored text on default background (muted)
+                tmux set-window-option -t "$SESSION_NAME:$window" window-status-style "fg=$window_color,bg=default"
+                log "Applied color $window_color to window $window tab (active=background, inactive=text)"
+            fi
+
+            # Get pane arrays for this window
+            local -n panes_ref="${window^^}_PANES"
+            local -n sessions_ref="${window^^}_SESSIONS"
+            local pane_count=${#panes_ref[@]}
+
+            log "Window $window has $pane_count panes"
+
+            # Apply layout
+            if ! apply_layout "$SESSION_NAME:$window" "$pane_count" "$window_dir"; then
+                log "Warning: Layout application failed for $window"
+                continue
+            fi
+
+            # Brief tmux settle time (reduced from 0.5s)
+            sleep 0.1
+            # CONSERVATIVE TIMING (uncomment if issues arise):
+            # sleep 0.5
+
+            # Execute direct commands only (no subsession attachments yet)
+            for ((i=0; i<pane_count; i++)); do
+                local cmd="${panes_ref[$i]}"
+                local session_name="${sessions_ref[$i]}"
+
+                # Only execute direct commands for panes without subsessions
+                if [[ -z "$session_name" ]] && [[ -n "$cmd" ]]; then
+                    if ! execute_direct_command "$SESSION_NAME:$window" "$i" "$cmd"; then
+                        log "Warning: Failed to execute direct command in pane $i"
+                    fi
+                fi
+            done
         done
-    done
 
-    # Select first window and focus first pane
-    tmux select-window -t "$SESSION_NAME:1"
-    tmux select-pane -t "$SESSION_NAME:1.0"
+        # Brief stabilization (reduced from 1s)
+        log "All windows created. Brief stabilization before subsession attachments..."
+        sleep 0.3
+        # CONSERVATIVE TIMING (uncomment if race conditions return):
+        # sleep 1
 
-    log "Development environment ready. Attaching..."
-    exec tmux attach-session -t "$SESSION_NAME"
+        # PHASE 2: Attach to subsessions now that all windows have stable dimensions
+        log "Phase 2: Attaching subsessions to stable windows..."
+        for window in "${WINDOWS[@]}"; do
+            local -n panes_ref="${window^^}_PANES"
+            local -n sessions_ref="${window^^}_SESSIONS"
+            local pane_count=${#panes_ref[@]}
+
+            log "Attaching subsessions for window: $window"
+
+            for ((i=0; i<pane_count; i++)); do
+                local cmd="${panes_ref[$i]}"
+                local session_name="${sessions_ref[$i]}"
+
+                # Only attach subsessions in this phase
+                if [[ -n "$session_name" ]]; then
+                    if ! attach_to_subsession "$SESSION_NAME:$window" "$i" "$cmd" "$session_name"; then
+                        log "Warning: Failed to attach subsession in pane $i"
+                    fi
+                    sleep 0.05  # Minimal pause between attachments
+                fi
+            done
+        done
+
+        # Select first window and focus first pane
+        tmux select-window -t "$SESSION_NAME:1"
+        tmux select-pane -t "$SESSION_NAME:1.0"
+
+        # CONSERVATIVE LAYOUT RECALCULATION (uncomment if dimension issues arise):
+        # tmux refresh-client -t "$SESSION_NAME" 2>/dev/null || true
+
+    fi
+
+    # Unified attachment point - runs for both new and existing sessions
+    # Unset window-size option to allow automatic resizing
+    tmux set-option -u window-size 2>/dev/null || true
+
+    if [[ "$headless_mode" == "true" ]]; then
+        log "Session ready and running in background. Use 'tmux attach-session -t $SESSION_NAME' to connect."
+    else
+        log "Attaching to session..."
+        exec tmux attach-session -t "$SESSION_NAME"
+    fi
 }
 
 # Status checker - instant feedback
 show_status() {
     # Load config to get SESSION_NAME and subsession info
     if source "$CONFIG_FILE" 2>/dev/null; then
-        if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-            echo "✓ Main session: $SESSION_NAME (running)"
+        if session_exists "$SESSION_NAME"; then
+            echo "� Main session: $SESSION_NAME (running)"
 
-            # List subsessions from config (like stop_session does)
-            local subsessions=()
-            for window in "${WINDOWS[@]}"; do
-                local -n sessions_ref="${window^^}_SESSIONS"
-                for session_name in "${sessions_ref[@]}"; do
-                    if [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
-                        subsessions+=("$session_name")
-                    fi
-                done
-            done
+            # List subsessions from config
+            local subsessions=($(get_running_subsessions))
 
             if [[ ${#subsessions[@]} -gt 0 ]]; then
-                echo "✓ Subsessions:"
+                echo "� Subsessions:"
                 printf "  - %s\n" "${subsessions[@]}"
             fi
         else
-            echo "✗ Session not running"
+            echo "� Session not running"
         fi
     else
-        echo "✗ Failed to load config"
+        echo "� Failed to load config"
     fi
 }
 
 # Stop main session only (preserve subsessions)
 stop_session() {
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if session_exists "$SESSION_NAME"; then
         log "Stopping main session: $SESSION_NAME"
         tmux kill-session -t "$SESSION_NAME"
 
         # Show which subsessions are still running
         if source "$CONFIG_FILE" 2>/dev/null; then
-            local subsessions=()
-            for window in "${WINDOWS[@]}"; do
-                local -n sessions_ref="${window^^}_SESSIONS"
-                for session_name in "${sessions_ref[@]}"; do
-                    [[ -n "$session_name" ]] && subsessions+=("$session_name")
-                done
-            done
-
-            local running_subsessions=()
-            for session_name in "${subsessions[@]}"; do
-                if tmux has-session -t "$session_name" 2>/dev/null; then
-                    running_subsessions+=("$session_name")
-                fi
-            done
+            local running_subsessions=($(get_running_subsessions))
 
             if [[ ${#running_subsessions[@]} -gt 0 ]]; then
                 log "Main session stopped. Subsessions still running: ${running_subsessions[*]}"
@@ -526,7 +604,7 @@ stop_session() {
         log "No main session found: $SESSION_NAME"
     fi
 
-    rm -f /tmp/session-tmux.conf
+    rm -f /tmp/session-tmux.conf /tmp/${SESSION_NAME}-time.sh
 }
 
 # Kill main session and subsessions with confirmation
@@ -534,21 +612,14 @@ kill_all() {
     local active_sessions=()
 
     # Check which sessions exist
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if session_exists "$SESSION_NAME"; then
         active_sessions+=("$SESSION_NAME (main)")
     fi
 
     # Check for subsessions created by this config
     if source "$CONFIG_FILE" 2>/dev/null; then
-        local subsessions=()
-        for window in "${WINDOWS[@]}"; do
-            local -n sessions_ref="${window^^}_SESSIONS"
-            for session_name in "${sessions_ref[@]}"; do
-                if [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
-                    active_sessions+=("$session_name")
-                fi
-            done
-        done
+        local subsessions=($(get_running_subsessions))
+        active_sessions+=("${subsessions[@]}")
     fi
 
     if [[ ${#active_sessions[@]} -eq 0 ]]; then
@@ -571,26 +642,22 @@ kill_all() {
     fi
 
     # Kill main session
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if session_exists "$SESSION_NAME"; then
         log "Killing main session: $SESSION_NAME"
         tmux kill-session -t "$SESSION_NAME"
     fi
 
     # Kill subsessions
     if source "$CONFIG_FILE" 2>/dev/null; then
-        for window in "${WINDOWS[@]}"; do
-            local -n sessions_ref="${window^^}_SESSIONS"
-            for session_name in "${sessions_ref[@]}"; do
-                if [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
-                    log "Killing subsession: $session_name"
-                    tmux kill-session -t "$session_name"
-                fi
-            done
+        local subsessions=($(get_running_subsessions))
+        for session_name in "${subsessions[@]}"; do
+            log "Killing subsession: $session_name"
+            tmux kill-session -t "$session_name"
         done
     fi
 
     log "Sessions terminated"
-    rm -f /tmp/session-tmux.conf
+    rm -f /tmp/session-tmux.conf /tmp/${SESSION_NAME}-time.sh
 }
 
 # Install a named session from config
@@ -620,7 +687,10 @@ export CONFIG_FILE
 
 case "\${1:-start}" in
     "start"|"")
-        exec "$SCRIPT_PATH" start-session
+        exec "$SCRIPT_PATH" start-session "\$2"
+        ;;
+    "--headless")
+        exec "$SCRIPT_PATH" start-session --headless
         ;;
     "stop")
         exec "$SCRIPT_PATH" stop-session
@@ -632,11 +702,12 @@ case "\${1:-start}" in
         exec "$SCRIPT_PATH" status-session
         ;;
     *)
-        echo "Usage: $SESSION_NAME [start|stop|kill|status]"
-        echo "  start   - Start or attach to session (default)"
-        echo "  stop    - Stop main session (keep sub-sessions)"
-        echo "  kill    - Kill ALL sessions with confirmation"
-        echo "  status  - Show session status"
+        echo "Usage: $SESSION_NAME [start|--headless|stop|kill|status]"
+        echo "  start      - Start or attach to session (default)"
+        echo "  --headless - Start session in background without attaching"
+        echo "  stop       - Stop main session (keep sub-sessions)"
+        echo "  kill       - Kill ALL sessions with confirmation"
+        echo "  status     - Show session status"
         exit 1
         ;;
 esac
@@ -662,24 +733,24 @@ EOF
 
 # List installed sessions
 list_installations() {
-    [[ -f "$INSTALL_REGISTRY" ]] || {
+    if ! iter_registry >/dev/null; then
         log "No sessions installed"
         return 0
-    }
+    fi
 
     echo "Installed Sessions:"
     echo "=================="
-    while IFS=: read -r name config_path install_date; do
-        local status="✓"
-        [[ -f "$INSTALL_DIR/$name" ]] || status="✗ (missing)"
-        [[ -f "$config_path" ]] || status="✗ (config missing)"
+    iter_registry | while IFS=: read -r name config_path install_date; do
+        local status="�"
+        [[ -f "$INSTALL_DIR/$name" ]] || status="� (missing)"
+        [[ -f "$config_path" ]] || status="� (config missing)"
 
         echo "$name"
         echo "  Command: $INSTALL_DIR/$name $status"
         echo "  Config:  $config_path"
         echo "  Installed: $install_date"
         echo
-    done < "$INSTALL_REGISTRY"
+    done
 }
 
 # Remove installed session
@@ -707,7 +778,7 @@ remove_installation() {
     fi
 
     # Kill any running sessions
-    if tmux has-session -t "$session_name" 2>/dev/null; then
+    if session_exists "$session_name"; then
         log "Killing running session: $session_name"
         tmux kill-session -t "$session_name"
     fi
@@ -761,13 +832,13 @@ EOF
 
     # Show completion message
     echo
-    echo "🚀 Session Manager v2 Setup Complete!"
+    echo "� Session Manager v2 Setup Complete!"
     echo "======================================"
     echo
-    echo "✅ Script executable: $SCRIPT_PATH"
-    echo "✅ Global command: session-manager"
-    echo "✅ Install directory: $INSTALL_DIR"
-    echo "✅ Registry: $HOME/.config/session-manager/"
+    echo "� Script executable: $SCRIPT_PATH"
+    echo "� Global command: session-manager"
+    echo "� Install directory: $INSTALL_DIR"
+    echo "� Registry: $HOME/.config/session-manager/"
     echo
     echo "Usage:"
     echo "  session-manager install /path/to/config.sh"
@@ -781,20 +852,20 @@ EOF
 
 # Show status of all installed sessions
 status_all_sessions() {
-    [[ -f "$INSTALL_REGISTRY" ]] || {
+    if ! iter_registry >/dev/null; then
         log "No sessions installed"
         return 0
-    }
+    fi
 
     echo "Global Session Status"
     echo "===================="
 
-    while IFS=: read -r name config_path install_date; do
+    iter_registry | while IFS=: read -r name config_path install_date; do
         echo "Session: $name"
 
         # Check if main session exists
-        if tmux has-session -t "$name" 2>/dev/null; then
-            echo "  Main: ✓ Running"
+        if session_exists "$name"; then
+            echo "  Main: � Running"
 
             # Show windows
             local windows
@@ -804,54 +875,40 @@ status_all_sessions() {
             # Count sub-sessions by loading config
             if [[ -f "$config_path" ]]; then
                 source "$config_path" 2>/dev/null
-                local subsession_count=0
-                for window in "${WINDOWS[@]}"; do
-                    local -n sessions_ref="${window^^}_SESSIONS"
-                    for session_name in "${sessions_ref[@]}"; do
-                        if [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
-                            ((subsession_count++))
-                        fi
-                    done 2>/dev/null
-                done 2>/dev/null
-                echo "  Sub-sessions: $subsession_count running"
+                local subsessions=($(get_running_subsessions))
+                echo "  Sub-sessions: ${#subsessions[@]} running"
             fi
         else
-            echo "  Main: ✗ Not running"
+            echo "  Main: � Not running"
         fi
 
         echo "  Config: $config_path"
         echo
-    done < "$INSTALL_REGISTRY"
+    done
 }
 
 # Kill all sessions from all installations
 kill_all_sessions() {
-    [[ -f "$INSTALL_REGISTRY" ]] || {
+    if ! iter_registry >/dev/null; then
         log "No sessions installed"
         return 0
-    }
+    fi
 
     local all_sessions=()
 
-    # Collect all sessions
+    # Collect all sessions - use process substitution to avoid subshell
     while IFS=: read -r name config_path install_date; do
-        if tmux has-session -t "$name" 2>/dev/null; then
+        if session_exists "$name"; then
             all_sessions+=("$name (main)")
         fi
 
         # Load config to find sub-sessions
         if [[ -f "$config_path" ]]; then
             source "$config_path" 2>/dev/null
-            for window in "${WINDOWS[@]}"; do
-                local -n sessions_ref="${window^^}_SESSIONS"
-                for session_name in "${sessions_ref[@]}"; do
-                    if [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
-                        all_sessions+=("$session_name")
-                    fi
-                done 2>/dev/null
-            done 2>/dev/null
+            local subsessions=($(get_running_subsessions))
+            all_sessions+=("${subsessions[@]}")
         fi
-    done < "$INSTALL_REGISTRY"
+    done < <(iter_registry)
 
     if [[ ${#all_sessions[@]} -eq 0 ]]; then
         log "No running sessions found"
@@ -875,7 +932,7 @@ kill_all_sessions() {
     # Kill all sessions
     for session in "${all_sessions[@]}"; do
         local session_name="${session% (*}"  # Remove " (main)" suffix
-        if tmux has-session -t "$session_name" 2>/dev/null; then
+        if session_exists "$session_name"; then
             log "Killing session: $session_name"
             tmux kill-session -t "$session_name"
         fi
@@ -893,18 +950,18 @@ cleanup_orphaned() {
     local cleaned=0
 
     # Clean up registry entries with missing configs
-    if [[ -f "$INSTALL_REGISTRY" ]]; then
+    if iter_registry >/dev/null; then
         echo "Checking registry entries..."
         local temp_registry="/tmp/session-registry-clean.$$"
-        while IFS=: read -r name config_path install_date; do
+        iter_registry | while IFS=: read -r name config_path install_date; do
             if [[ -f "$config_path" ]] && [[ -f "$INSTALL_DIR/$name" ]]; then
                 echo "$name:$config_path:$install_date" >> "$temp_registry"
             else
-                echo "  ✗ Orphaned: $name (config or command missing)"
+                echo "  � Orphaned: $name (config or command missing)"
                 log "Removing orphaned registry entry: $name"
                 ((cleaned++))
             fi
-        done < "$INSTALL_REGISTRY"
+        done
 
         if [[ -f "$temp_registry" ]]; then
             mv "$temp_registry" "$INSTALL_REGISTRY"
@@ -926,7 +983,7 @@ cleanup_orphaned() {
             # Check if it's a session-manager generated file
             if grep -q "# Auto-generated session command" "$cmd_file" 2>/dev/null; then
                 if [[ ! -f "$INSTALL_REGISTRY" ]] || ! grep -q "^$cmd_name:" "$INSTALL_REGISTRY" 2>/dev/null; then
-                    echo "  ✗ Orphaned command: $cmd_file"
+                    echo "  � Orphaned command: $cmd_file"
                     log "Removing orphaned command: $cmd_file"
                     rm -f "$cmd_file"
                     ((cleaned++))
@@ -969,7 +1026,7 @@ main() {
         "start-session")
             # Called from installed session command
             determine_config
-            start_session
+            start_session "$2"
             ;;
         "stop-session")
             determine_config
@@ -1030,6 +1087,7 @@ Per-Session Commands (created after install):
 Each installed session creates its own command with these options:
 
   <session-name>                           Start/attach to the session
+  <session-name> --headless                Start session in background without attaching
   <session-name> stop                      Stop main session (keep sub-sessions)
   <session-name> kill                      Kill ALL sessions with confirmation
   <session-name> status                    Show session status
@@ -1047,6 +1105,7 @@ Examples:
 
   # Use the installed session commands:
   randomsession                 # Start/attach to randomsession session
+  randomsession --headless      # Start randomsession session in background
   randomsession status          # Show randomsession session status
   randomsession stop            # Stop main randomsession session
   randomsession kill            # Kill all randomsession sessions
