@@ -2,19 +2,9 @@
 # Session Manager v2 - No chmod required
 # Setup: bash [path_to_sessionmanager_file] setup
 
-# IMPORTANT: UTF-8 Fix for tmux border characters
-# If tmux borders display as 'qqqqq' or 'xxxxx' instead of clean lines,
-# you need to set UTF-8 locale in your shell profile (~/.bashrc or ~/.zshrc):
-#
-#   export LANG=C.UTF-8
-#   export LC_ALL=C.UTF-8
-#
-# Then logout/login or source your profile.
-# NOTE: The tmux -u flag does NOT fix this issue - proper locale is required.
-
 # Auto-chmod if not executable
 [[ ! -x "$0" ]] && chmod +x "$0" && exec bash "$0" "$@"
-#
+# 
 set -eo pipefail
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +27,35 @@ log() { echo "INFO: $*" >&2; }
 # Helper functions - DRY principle
 session_exists() {
     tmux has-session -t "$1" 2>/dev/null
+}
+
+# Exclude session from tmux-resurrect
+# This ensures session_manager is the single source of truth for these sessions
+exclude_from_resurrect() {
+    local session_name="$1"
+
+    # Check if resurrect plugin is installed
+    if ! tmux show-option -gv @resurrect-save-session-ignore &>/dev/null; then
+        # Resurrect not installed or option doesn't exist, skip silently
+        return 0
+    fi
+
+    # Get current ignore list
+    local current_ignore=$(tmux show-option -gv @resurrect-save-session-ignore 2>/dev/null || echo "")
+
+    # Check if session already in ignore list
+    if [[ ",$current_ignore," == *",$session_name,"* ]]; then
+        return 0  # Already excluded
+    fi
+
+    # Add session to ignore list
+    if [[ -z "$current_ignore" ]]; then
+        tmux set-option -g @resurrect-save-session-ignore "$session_name"
+    else
+        tmux set-option -g @resurrect-save-session-ignore "${current_ignore},${session_name}"
+    fi
+
+    log "Excluded '$session_name' from tmux-resurrect"
 }
 
 # Create session-specific timezone script from config
@@ -405,6 +424,9 @@ start_session() {
         # Create main session with custom config
         tmux -f /tmp/session-tmux.conf new-session -d -s "$SESSION_NAME"
 
+        # Exclude from tmux-resurrect (session_manager manages this)
+        exclude_from_resurrect "$SESSION_NAME"
+
         # Unset window-size option early to ensure proper layout calculations
         tmux set-option -u window-size 2>/dev/null || true
 
@@ -447,6 +469,9 @@ start_session() {
                         tmux set-option -t "$session_name" status-left "#[fg=${subsession_color},bold] #S #[default]"
                         tmux set-option -t "$session_name" status-right "#[fg=${subsession_color}] #($TIMEZONE_SCRIPT) #[default]"
                     fi
+
+                    # Exclude subsession from tmux-resurrect
+                    exclude_from_resurrect "$session_name"
                 fi
             done
         done
