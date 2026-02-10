@@ -528,6 +528,214 @@ clean_dev_tools() {
     fi
 }
 
+# Function to clean Wrangler logs
+clean_wrangler_logs() {
+    log_info "Checking Cloudflare Wrangler logs..."
+
+    WRANGLER_LOGS="$HOME/.config/.wrangler/logs"
+    if [ -d "$WRANGLER_LOGS" ]; then
+        TOTAL_SIZE=$(get_size "$WRANGLER_LOGS")
+        LOG_COUNT=$(find "$WRANGLER_LOGS" -name "*.log" -type f 2>/dev/null | wc -l)
+        
+        if [ "$LOG_COUNT" -gt 0 ]; then
+            log_info "Found $LOG_COUNT Wrangler log files using: $TOTAL_SIZE"
+            
+            # Show largest log files
+            echo -e "${YELLOW}Largest Wrangler logs:${NC}"
+            find "$WRANGLER_LOGS" -name "*.log" -type f -exec du -h {} + 2>/dev/null | sort -rh | head -5
+            echo
+            
+            # Offer to keep only recent logs (last 7 days)
+            OLD_LOGS=$(find "$WRANGLER_LOGS" -name "*.log" -type f -mtime +7 2>/dev/null)
+            if [ -n "$OLD_LOGS" ]; then
+                OLD_COUNT=$(echo "$OLD_LOGS" | wc -l)
+                OLD_SIZE=$(echo "$OLD_LOGS" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
+                log_info "Found $OLD_COUNT log files older than 7 days using: $OLD_SIZE"
+                
+                if confirm_action "Remove Wrangler logs older than 7 days?"; then
+                    echo "$OLD_LOGS" | xargs rm -f 2>/dev/null || true
+                    log_success "Removed old Wrangler logs"
+                fi
+            fi
+            
+            # Offer to remove all logs
+            REMAINING_LOGS=$(find "$WRANGLER_LOGS" -name "*.log" -type f 2>/dev/null | wc -l)
+            if [ "$REMAINING_LOGS" -gt 0 ]; then
+                REMAINING_SIZE=$(get_size "$WRANGLER_LOGS")
+                log_info "Remaining logs: $REMAINING_LOGS files using $REMAINING_SIZE"
+                
+                if confirm_action "Remove ALL Wrangler logs?"; then
+                    find "$WRANGLER_LOGS" -name "*.log" -type f -delete 2>/dev/null || true
+                    log_success "Removed all Wrangler logs"
+                fi
+            fi
+        else
+            log_info "No Wrangler logs found"
+        fi
+    else
+        log_info "Wrangler logs directory not found"
+    fi
+}
+
+# Function to clean cached installers
+clean_cached_installers() {
+    log_info "Checking cached installer files..."
+
+    USER_CACHE="$HOME/.cache"
+    if [ -d "$USER_CACHE" ]; then
+        # Find cached installer files (.deb, .rpm, .tar.gz, .zip, .AppImage)
+        INSTALLER_PATTERNS=(-name "*.deb" -o -name "*.rpm" -o -name "*.AppImage")
+        
+        # Look for installer packages
+        INSTALLERS=$(find "$USER_CACHE" -type f \( "${INSTALLER_PATTERNS[@]}" \) -size +10M 2>/dev/null)
+        
+        if [ -n "$INSTALLERS" ]; then
+            INSTALLER_COUNT=$(echo "$INSTALLERS" | wc -l)
+            INSTALLER_SIZE=$(echo "$INSTALLERS" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
+            
+            log_info "Found $INSTALLER_COUNT cached installer files using: $INSTALLER_SIZE"
+            echo -e "${YELLOW}Cached installers:${NC}"
+            echo "$INSTALLERS" | xargs du -h 2>/dev/null | sort -rh
+            echo
+            
+            if confirm_action "Remove cached installer files?"; then
+                echo "$INSTALLERS" | xargs rm -f 2>/dev/null || true
+                log_success "Removed cached installer files"
+            fi
+        else
+            log_info "No large cached installer files found"
+        fi
+        
+        # Check for old downloaded archives in cache subdirectories
+        CACHE_ARCHIVES=$(find "$USER_CACHE" -type f \( -name "*.tar.gz" -o -name "*.tgz" -o -name "*.zip" \) -size +50M 2>/dev/null)
+        
+        if [ -n "$CACHE_ARCHIVES" ]; then
+            ARCHIVE_COUNT=$(echo "$CACHE_ARCHIVES" | wc -l)
+            ARCHIVE_SIZE=$(echo "$CACHE_ARCHIVES" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
+            
+            log_info "Found $ARCHIVE_COUNT large archive files in cache using: $ARCHIVE_SIZE"
+            echo -e "${YELLOW}Large cache archives:${NC}"
+            echo "$CACHE_ARCHIVES" | xargs du -h 2>/dev/null | sort -rh | head -10
+            echo
+            
+            if confirm_action "Remove large archive files from cache?"; then
+                echo "$CACHE_ARCHIVES" | xargs rm -f 2>/dev/null || true
+                log_success "Removed large cache archives"
+            fi
+        fi
+        
+        # Clean specific known cache directories that hold installers
+        for CACHE_SUBDIR in code-server code vscode chromium; do
+            CACHE_PATH="$USER_CACHE/$CACHE_SUBDIR"
+            if [ -d "$CACHE_PATH" ]; then
+                # Look for old installer packages in these directories
+                OLD_PACKAGES=$(find "$CACHE_PATH" -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.tar.gz" \) 2>/dev/null)
+                
+                if [ -n "$OLD_PACKAGES" ]; then
+                    PACKAGE_COUNT=$(echo "$OLD_PACKAGES" | wc -l)
+                    PACKAGE_SIZE=$(echo "$OLD_PACKAGES" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
+                    
+                    log_info "Found $PACKAGE_COUNT old packages in $CACHE_SUBDIR cache using: $PACKAGE_SIZE"
+                    echo -e "${YELLOW}Packages in $CACHE_SUBDIR:${NC}"
+                    echo "$OLD_PACKAGES" | xargs du -h 2>/dev/null
+                    echo
+                    
+                    if confirm_action "Remove old $CACHE_SUBDIR packages?"; then
+                        echo "$OLD_PACKAGES" | xargs rm -f 2>/dev/null || true
+                        log_success "Removed old $CACHE_SUBDIR packages"
+                    fi
+                fi
+            fi
+        done
+    fi
+}
+
+# Function to clean orphaned node_modules
+clean_orphaned_node_modules() {
+    log_info "Checking for orphaned node_modules directories..."
+
+    # Find all node_modules directories in home
+    NODE_MODULES=$(find "$HOME" -type d -name "node_modules" 2>/dev/null)
+    
+    if [ -n "$NODE_MODULES" ]; then
+        ORPHANED=""
+        
+        echo "$NODE_MODULES" | while read -r nm_dir; do
+            # Get parent directory
+            PARENT_DIR=$(dirname "$nm_dir")
+            
+            # Check if there's a package.json in the parent directory
+            if [ ! -f "$PARENT_DIR/package.json" ]; then
+                # Also check one level up (for monorepo workspace packages)
+                GRANDPARENT_DIR=$(dirname "$PARENT_DIR")
+                if [ ! -f "$GRANDPARENT_DIR/package.json" ]; then
+                    # This is likely orphaned
+                    SIZE=$(get_size "$nm_dir")
+                    echo "$nm_dir|$SIZE"
+                fi
+            fi
+        done > /tmp/orphaned_nm.txt
+        
+        if [ -s /tmp/orphaned_nm.txt ]; then
+            ORPHAN_COUNT=$(wc -l < /tmp/orphaned_nm.txt)
+            
+            log_info "Found $ORPHAN_COUNT potentially orphaned node_modules directories"
+            echo -e "${YELLOW}Orphaned node_modules:${NC}"
+            
+            while IFS='|' read -r dir size; do
+                echo "  $size - $dir"
+            done < /tmp/orphaned_nm.txt
+            echo
+            
+            log_warning "These directories don't have a package.json in their parent directory"
+            log_warning "Review carefully before deleting - some may be intentional (e.g., global installs)"
+            
+            if confirm_action "Show detailed information about these directories?"; then
+                while IFS='|' read -r dir size; do
+                    echo -e "\n${BLUE}Directory:${NC} $dir"
+                    echo -e "${BLUE}Size:${NC} $size"
+                    echo -e "${BLUE}Last modified:${NC} $(stat -c %y "$dir" 2>/dev/null | cut -d' ' -f1)"
+                    echo -e "${BLUE}File count:${NC} $(find "$dir" -type f 2>/dev/null | wc -l)"
+                    
+                    # Try to identify what project this might have been from
+                    if [ -f "$dir/../package-lock.json" ]; then
+                        echo -e "${BLUE}Note:${NC} package-lock.json exists (package.json might have been deleted)"
+                    fi
+                done < /tmp/orphaned_nm.txt
+                echo
+            fi
+            
+            if confirm_action "Remove orphaned node_modules directories?"; then
+                while IFS='|' read -r dir size; do
+                    log_info "Removing: $dir ($size)"
+                    rm -rf "$dir" 2>/dev/null || log_error "Failed to remove $dir"
+                done < /tmp/orphaned_nm.txt
+                log_success "Removed orphaned node_modules"
+            fi
+        else
+            log_info "No orphaned node_modules directories found"
+        fi
+        
+        rm -f /tmp/orphaned_nm.txt
+    else
+        log_info "No node_modules directories found in $HOME"
+    fi
+    
+    # Also check for node_modules in the home root (common mistake)
+    if [ -d "$HOME/node_modules" ]; then
+        if [ ! -f "$HOME/package.json" ]; then
+            SIZE=$(get_size "$HOME/node_modules")
+            log_warning "Found node_modules in $HOME root without package.json ($SIZE)"
+            log_warning "This is likely from running 'npm install' in the wrong directory"
+            
+            if confirm_action "Remove $HOME/node_modules?"; then
+                rm -rf "$HOME/node_modules"
+                log_success "Removed $HOME/node_modules"
+            fi
+        fi
+    fi
+}
+
 # Function to find large files
 find_large_files() {
     log_info "Looking for large files in $HOME..."
@@ -557,6 +765,12 @@ main() {
     clean_package_caches
     echo
     clean_dev_tools
+    echo
+    clean_wrangler_logs
+    echo
+    clean_cached_installers
+    echo
+    clean_orphaned_node_modules
     echo
     clean_temp_files
     echo
