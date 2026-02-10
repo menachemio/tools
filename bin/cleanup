@@ -55,11 +55,9 @@ clean_vscode_server() {
         SIZE=$(get_size "$VSCODE_DIR")
         log_info "VS Code Server is using: $SIZE"
 
-        TOTAL_FREED=0
-
-        # Clean old extension versions (keep only the latest version of each extension)
+        # More aggressive cleanup - remove old extensions automatically
         if [ -d "$VSCODE_DIR/extensions" ]; then
-            log_info "Checking for old extension versions..."
+            log_info "Cleaning old extension versions..."
 
             # Get list of extensions with multiple versions
             OLD_EXTENSIONS=""
@@ -78,143 +76,127 @@ clean_vscode_server() {
             if [ -n "$OLD_EXTENSIONS" ]; then
                 OLD_EXT_COUNT=$(echo -e "$OLD_EXTENSIONS" | grep -c "^/")
                 OLD_EXT_SIZE=$(echo -e "$OLD_EXTENSIONS" | xargs -I {} du -sh {} 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                log_info "Found $OLD_EXT_COUNT old extension versions using approx $OLD_EXT_SIZE"
-
-                if confirm_action "Remove old extension versions?"; then
-                    echo -e "$OLD_EXTENSIONS" | while read -r ext_dir; do
-                        if [ -n "$ext_dir" ] && [ -d "$ext_dir" ]; then
-                            rm -rf "$ext_dir"
-                        fi
-                    done
-                    log_success "Removed old extension versions"
-                fi
+                log_info "Removing $OLD_EXT_COUNT old extension versions ($OLD_EXT_SIZE)"
+                echo -e "$OLD_EXTENSIONS" | while read -r ext_dir; do
+                    if [ -n "$ext_dir" ] && [ -d "$ext_dir" ]; then
+                        rm -rf "$ext_dir"
+                    fi
+                done
+                log_success "Removed old extension versions"
             fi
         fi
 
-        # Clean CLI folder (usually contains old downloads)
+        # Auto-clean CLI folder
         if [ -d "$VSCODE_DIR/cli" ]; then
             CLI_SIZE=$(get_size "$VSCODE_DIR/cli")
             if [[ "$CLI_SIZE" != "0" ]]; then
-                log_info "VS Code CLI folder is using: $CLI_SIZE"
-                if confirm_action "Clear VS Code CLI folder?"; then
-                    rm -rf "$VSCODE_DIR/cli"
-                    log_success "Cleared VS Code CLI folder"
-                fi
+                log_info "Removing VS Code CLI folder: $CLI_SIZE"
+                rm -rf "$VSCODE_DIR/cli"
+                log_success "Cleared VS Code CLI folder"
             fi
         fi
 
-        # Clean old code installations (keep only current)
-        if [ -d "$VSCODE_DIR" ]; then
-            # Find code-* directories (old server installations)
-            OLD_SERVERS=$(find "$VSCODE_DIR" -maxdepth 1 -name "code-*" -type d 2>/dev/null)
-            if [ -n "$OLD_SERVERS" ]; then
-                SERVER_COUNT=$(echo "$OLD_SERVERS" | wc -l)
-                SERVER_SIZE=$(echo "$OLD_SERVERS" | xargs du -sh 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                log_info "Found $SERVER_COUNT old server installation(s) using approx $SERVER_SIZE"
-
-                if confirm_action "Remove old server installations?"; then
-                    echo "$OLD_SERVERS" | xargs rm -rf 2>/dev/null || true
-                    log_success "Removed old server installations"
-                fi
-            fi
+        # Auto-clean old code installations
+        OLD_SERVERS=$(find "$VSCODE_DIR" -maxdepth 1 -name "code-*" -type d 2>/dev/null)
+        if [ -n "$OLD_SERVERS" ]; then
+            SERVER_COUNT=$(echo "$OLD_SERVERS" | wc -l)
+            SERVER_SIZE=$(echo "$OLD_SERVERS" | xargs du -sh 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
+            log_info "Removing $SERVER_COUNT old server installation(s) ($SERVER_SIZE)"
+            echo "$OLD_SERVERS" | xargs rm -rf 2>/dev/null || true
+            log_success "Removed old server installations"
         fi
 
-        # Clean data folder components
+        # Clean data folder components (CONSERVATIVE - keep settings)
         if [ -d "$VSCODE_DIR/data" ]; then
-            # Clean all cached data
-            for cache_dir in CachedData CachedExtensionVSIXs CachedProfilesData; do
+            # Only clean safe cache directories
+            for cache_dir in CachedData CachedExtensionVSIXs; do
                 if [ -d "$VSCODE_DIR/data/$cache_dir" ]; then
                     CACHE_SIZE=$(get_size "$VSCODE_DIR/data/$cache_dir")
                     if [[ "$CACHE_SIZE" != "0" ]]; then
-                        log_info "VS Code $cache_dir is using: $CACHE_SIZE"
-                        if confirm_action "Clear $cache_dir?"; then
-                            rm -rf "$VSCODE_DIR/data/$cache_dir"
-                            mkdir -p "$VSCODE_DIR/data/$cache_dir"
-                            log_success "Cleared $cache_dir"
-                        fi
+                        log_info "Clearing VS Code $cache_dir: $CACHE_SIZE"
+                        rm -rf "$VSCODE_DIR/data/$cache_dir"
+                        mkdir -p "$VSCODE_DIR/data/$cache_dir"
+                        log_success "Cleared $cache_dir"
                     fi
                 fi
             done
 
-            # Clean old logs (keep last 3 days)
+            # Conservative log cleanup - keep recent logs (last 7 days)
             if [ -d "$VSCODE_DIR/data/logs" ]; then
-                OLD_LOGS=$(find "$VSCODE_DIR/data/logs" -maxdepth 1 -type d -mtime +3 2>/dev/null | wc -l)
-                if [ "$OLD_LOGS" -gt 0 ]; then
-                    LOG_SIZE=$(find "$VSCODE_DIR/data/logs" -maxdepth 1 -type d -mtime +3 -exec du -sh {} + 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                    log_info "Found $OLD_LOGS log directories older than 3 days using approx $LOG_SIZE"
-                    if confirm_action "Remove old VS Code logs?"; then
-                        find "$VSCODE_DIR/data/logs" -maxdepth 1 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null || true
-                        log_success "Removed old VS Code logs"
-                    fi
+                OLD_LOGS=$(find "$VSCODE_DIR/data/logs" -maxdepth 1 -type d -mtime +7 2>/dev/null)
+                if [ -n "$OLD_LOGS" ]; then
+                    OLD_COUNT=$(echo "$OLD_LOGS" | wc -l)
+                    LOG_SIZE=$(echo "$OLD_LOGS" | xargs du -sh 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
+                    log_info "Removing $OLD_COUNT old VS Code log folders ($LOG_SIZE)"
+                    echo "$OLD_LOGS" | xargs rm -rf 2>/dev/null || true
+                    log_success "Cleaned old VS Code logs"
                 fi
             fi
 
-            # Clean User folder components
+            # Conservative User folder cleanup
             if [ -d "$VSCODE_DIR/data/User" ]; then
-                # Clean caches
-                if [ -d "$VSCODE_DIR/data/User/caches" ]; then
-                    CACHE_SIZE=$(get_size "$VSCODE_DIR/data/User/caches")
-                    if [[ "$CACHE_SIZE" != "0" ]]; then
-                        log_info "VS Code User caches are using: $CACHE_SIZE"
-                        if confirm_action "Clear VS Code User caches?"; then
-                            rm -rf "$VSCODE_DIR/data/User/caches"
-                            mkdir -p "$VSCODE_DIR/data/User/caches"
-                            log_success "Cleared VS Code User caches"
+                # Only clean safe caches, not all caches
+                CACHE_DIRS=("caches/workbench" "caches/chromium")
+                for cache_subdir in "${CACHE_DIRS[@]}"; do
+                    if [ -d "$VSCODE_DIR/data/User/$cache_subdir" ]; then
+                        CACHE_SIZE=$(get_size "$VSCODE_DIR/data/User/$cache_subdir")
+                        if [[ "$CACHE_SIZE" != "0" ]]; then
+                            log_info "Clearing VS Code $cache_subdir: $CACHE_SIZE"
+                            rm -rf "$VSCODE_DIR/data/User/$cache_subdir"
+                            mkdir -p "$VSCODE_DIR/data/User/$cache_subdir"
+                            log_success "Cleared $cache_subdir"
                         fi
                     fi
-                fi
+                done
 
-                # Clean History folder
+                # Only clean old History (keep recent)
                 if [ -d "$VSCODE_DIR/data/User/History" ]; then
-                    HISTORY_SIZE=$(get_size "$VSCODE_DIR/data/User/History")
-                    if [[ "$HISTORY_SIZE" != "0" ]]; then
-                        log_info "VS Code History is using: $HISTORY_SIZE"
-                        if confirm_action "Clear VS Code History?"; then
-                            rm -rf "$VSCODE_DIR/data/User/History"
-                            mkdir -p "$VSCODE_DIR/data/User/History"
-                            log_success "Cleared VS Code History"
+                    OLD_HISTORY=$(find "$VSCODE_DIR/data/User/History" -maxdepth 1 -type d -mtime +30 2>/dev/null)
+                    if [ -n "$OLD_HISTORY" ]; then
+                        HISTORY_COUNT=$(echo "$OLD_HISTORY" | wc -l)
+                        HISTORY_SIZE=$(echo "$OLD_HISTORY" | xargs du -sh 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
+                        if confirm_action "Remove $HISTORY_COUNT old VS Code history folders ($HISTORY_SIZE)?"; then
+                            echo "$OLD_HISTORY" | xargs rm -rf 2>/dev/null || true
+                            log_success "Cleaned old VS Code history"
                         fi
                     fi
                 fi
 
-                # Clean Backups
+                # Conservative backup cleanup - only very old backups
                 if [ -d "$VSCODE_DIR/data/User/Backups" ]; then
-                    BACKUP_SIZE=$(get_size "$VSCODE_DIR/data/User/Backups")
-                    if [[ "$BACKUP_SIZE" != "0" ]]; then
-                        log_info "VS Code backups are using: $BACKUP_SIZE"
-                        if confirm_action "Clear VS Code backups?"; then
-                            rm -rf "$VSCODE_DIR/data/User/Backups"
-                            mkdir -p "$VSCODE_DIR/data/User/Backups"
-                            log_success "Cleared VS Code backups"
+                    OLD_BACKUPS=$(find "$VSCODE_DIR/data/User/Backups" -maxdepth 1 -type d -mtime +30 2>/dev/null)
+                    if [ -n "$OLD_BACKUPS" ]; then
+                        BACKUP_COUNT=$(echo "$OLD_BACKUPS" | wc -l)
+                        BACKUP_SIZE=$(echo "$OLD_BACKUPS" | xargs du -sh 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
+                        if confirm_action "Remove $BACKUP_COUNT old VS Code backups older than 30 days ($BACKUP_SIZE)?"; then
+                            echo "$OLD_BACKUPS" | xargs rm -rf 2>/dev/null || true
+                            log_success "Cleaned old VS Code backups"
                         fi
                     fi
                 fi
 
-                # Clean old workspace storage (older than 30 days)
+                # Clean old workspace storage (keep recent)
                 if [ -d "$VSCODE_DIR/data/User/workspaceStorage" ]; then
-                    OLD_WS=$(find "$VSCODE_DIR/data/User/workspaceStorage" -maxdepth 1 -type d -mtime +30 2>/dev/null | wc -l)
-                    if [ "$OLD_WS" -gt 0 ]; then
-                        WS_SIZE=$(find "$VSCODE_DIR/data/User/workspaceStorage" -maxdepth 1 -type d -mtime +30 -exec du -sh {} + 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                        log_info "Found $OLD_WS old workspace storage folders using approx $WS_SIZE"
-                        if confirm_action "Clean old workspace storage?"; then
-                            find "$VSCODE_DIR/data/User/workspaceStorage" -maxdepth 1 -type d -mtime +30 -exec rm -rf {} + 2>/dev/null || true
-                            log_success "Cleaned old workspace storage"
-                        fi
+                    OLD_WS=$(find "$VSCODE_DIR/data/User/workspaceStorage" -maxdepth 1 -type d -mtime +30 2>/dev/null)
+                    if [ -n "$OLD_WS" ]; then
+                        WS_COUNT=$(echo "$OLD_WS" | wc -l)
+                        WS_SIZE=$(echo "$OLD_WS" | xargs du -sh 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
+                        log_info "Removing $WS_COUNT old workspace folders >30 days ($WS_SIZE)"
+                        echo "$OLD_WS" | xargs rm -rf 2>/dev/null || true
+                        log_success "Cleaned old workspace storage"
                     fi
                 fi
             fi
         fi
 
-        # Clean bin folder (usually empty or has old references)
+        # Auto-clean bin folder
         if [ -d "$VSCODE_DIR/bin" ]; then
             BIN_SIZE=$(get_size "$VSCODE_DIR/bin")
             if [[ "$BIN_SIZE" != "0" ]]; then
-                log_info "VS Code bin folder is using: $BIN_SIZE"
-                if confirm_action "Clear VS Code bin folder?"; then
-                    rm -rf "$VSCODE_DIR/bin"
-                    mkdir -p "$VSCODE_DIR/bin"
-                    log_success "Cleared VS Code bin folder"
-                fi
+                log_info "Clearing VS Code bin folder: $BIN_SIZE"
+                rm -rf "$VSCODE_DIR/bin"
+                mkdir -p "$VSCODE_DIR/bin"
+                log_success "Cleared VS Code bin folder"
             fi
         fi
 
@@ -288,15 +270,9 @@ clean_package_caches() {
 clean_temp_files() {
     log_info "Checking temporary files..."
 
-    # System temp
+    # Skip /tmp cleanup - clears on reboot anyway
     TMP_SIZE=$(get_size "/tmp")
-    log_info "/tmp is using: $TMP_SIZE"
-
-    if confirm_action "Clean old files in /tmp (older than 7 days)?"; then
-        find /tmp -type f -atime +7 -delete 2>/dev/null || true
-        find /tmp -type d -empty -delete 2>/dev/null || true
-        log_success "Cleaned old temporary files"
-    fi
+    log_info "/tmp is using: $TMP_SIZE (will clear on reboot - skipping cleanup)"
 
     # User cache
     USER_CACHE="$HOME/.cache"
@@ -577,73 +553,84 @@ clean_wrangler_logs() {
     fi
 }
 
-# Function to clean cached installers
+# Function to clean cached installers and heavy cache directories
 clean_cached_installers() {
-    log_info "Checking cached installer files..."
+    log_info "Checking cached installer files and heavy caches..."
 
     USER_CACHE="$HOME/.cache"
     if [ -d "$USER_CACHE" ]; then
-        # Find cached installer files (.deb, .rpm, .tar.gz, .zip, .AppImage)
-        INSTALLER_PATTERNS=(-name "*.deb" -o -name "*.rpm" -o -name "*.AppImage")
+        # Safe cache cleanup with confirmations for large removals
+        PLAYWRIGHT_CACHE="$USER_CACHE/ms-playwright"
+        if [ -d "$PLAYWRIGHT_CACHE" ]; then
+            PLAYWRIGHT_SIZE=$(get_size "$PLAYWRIGHT_CACHE")
+            if [[ "$PLAYWRIGHT_SIZE" != "0" ]]; then
+                log_info "Found Playwright browsers cache: $PLAYWRIGHT_SIZE"
+                if confirm_action "Remove Playwright cache (safe - browsers will re-download as needed)?"; then
+                    rm -rf "$PLAYWRIGHT_CACHE"/* 2>/dev/null || true
+                    log_success "Cleared Playwright cache"
+                fi
+            fi
+        fi
+
+        # Code-server cache (usually safe but ask for confirmation)
+        CODE_SERVER_CACHE="$USER_CACHE/code-server"
+        if [ -d "$CODE_SERVER_CACHE" ]; then
+            CODESERVER_SIZE=$(get_size "$CODE_SERVER_CACHE")
+            if [[ "$CODESERVER_SIZE" != "0" ]]; then
+                log_info "Found code-server cache: $CODESERVER_SIZE"
+                if confirm_action "Remove code-server cache?"; then
+                    rm -rf "$CODE_SERVER_CACHE"/* 2>/dev/null || true
+                    log_success "Cleared code-server cache"
+                fi
+            fi
+        fi
+
+        # Claude cache (safe to rebuild - auto-remove)
+        CLAUDE_CACHE="$USER_CACHE/claude"
+        if [ -d "$CLAUDE_CACHE" ]; then
+            CLAUDE_SIZE=$(get_size "$CLAUDE_CACHE")
+            if [[ "$CLAUDE_SIZE" != "0" ]]; then
+                log_info "Removing Claude cache: $CLAUDE_SIZE (safe - rebuilds automatically)"
+                rm -rf "$CLAUDE_CACHE"/* 2>/dev/null || true
+                log_success "Cleared Claude cache"
+            fi
+        fi
         
-        # Look for installer packages
+        # Find and auto-remove cached installer files
+        INSTALLER_PATTERNS=(-name "*.deb" -o -name "*.rpm" -o -name "*.AppImage")
         INSTALLERS=$(find "$USER_CACHE" -type f \( "${INSTALLER_PATTERNS[@]}" \) -size +10M 2>/dev/null)
         
         if [ -n "$INSTALLERS" ]; then
             INSTALLER_COUNT=$(echo "$INSTALLERS" | wc -l)
             INSTALLER_SIZE=$(echo "$INSTALLERS" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
-            
-            log_info "Found $INSTALLER_COUNT cached installer files using: $INSTALLER_SIZE"
-            echo -e "${YELLOW}Cached installers:${NC}"
-            echo "$INSTALLERS" | xargs du -h 2>/dev/null | sort -rh
-            echo
-            
-            if confirm_action "Remove cached installer files?"; then
-                echo "$INSTALLERS" | xargs rm -f 2>/dev/null || true
-                log_success "Removed cached installer files"
-            fi
-        else
-            log_info "No large cached installer files found"
+            log_info "Removing $INSTALLER_COUNT cached installer files ($INSTALLER_SIZE)"
+            echo "$INSTALLERS" | xargs rm -f 2>/dev/null || true
+            log_success "Removed cached installer files"
         fi
         
-        # Check for old downloaded archives in cache subdirectories
+        # Auto-remove large archives from cache
         CACHE_ARCHIVES=$(find "$USER_CACHE" -type f \( -name "*.tar.gz" -o -name "*.tgz" -o -name "*.zip" \) -size +50M 2>/dev/null)
         
         if [ -n "$CACHE_ARCHIVES" ]; then
             ARCHIVE_COUNT=$(echo "$CACHE_ARCHIVES" | wc -l)
             ARCHIVE_SIZE=$(echo "$CACHE_ARCHIVES" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
-            
-            log_info "Found $ARCHIVE_COUNT large archive files in cache using: $ARCHIVE_SIZE"
-            echo -e "${YELLOW}Large cache archives:${NC}"
-            echo "$CACHE_ARCHIVES" | xargs du -h 2>/dev/null | sort -rh | head -10
-            echo
-            
-            if confirm_action "Remove large archive files from cache?"; then
-                echo "$CACHE_ARCHIVES" | xargs rm -f 2>/dev/null || true
-                log_success "Removed large cache archives"
-            fi
+            log_info "Removing $ARCHIVE_COUNT large archive files ($ARCHIVE_SIZE)"
+            echo "$CACHE_ARCHIVES" | xargs rm -f 2>/dev/null || true
+            log_success "Removed large cache archives"
         fi
         
-        # Clean specific known cache directories that hold installers
-        for CACHE_SUBDIR in code-server code vscode chromium; do
+        # Auto-clean specific known problematic cache directories
+        for CACHE_SUBDIR in code vscode chromium; do
             CACHE_PATH="$USER_CACHE/$CACHE_SUBDIR"
             if [ -d "$CACHE_PATH" ]; then
-                # Look for old installer packages in these directories
                 OLD_PACKAGES=$(find "$CACHE_PATH" -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.tar.gz" \) 2>/dev/null)
                 
                 if [ -n "$OLD_PACKAGES" ]; then
                     PACKAGE_COUNT=$(echo "$OLD_PACKAGES" | wc -l)
                     PACKAGE_SIZE=$(echo "$OLD_PACKAGES" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
-                    
-                    log_info "Found $PACKAGE_COUNT old packages in $CACHE_SUBDIR cache using: $PACKAGE_SIZE"
-                    echo -e "${YELLOW}Packages in $CACHE_SUBDIR:${NC}"
-                    echo "$OLD_PACKAGES" | xargs du -h 2>/dev/null
-                    echo
-                    
-                    if confirm_action "Remove old $CACHE_SUBDIR packages?"; then
-                        echo "$OLD_PACKAGES" | xargs rm -f 2>/dev/null || true
-                        log_success "Removed old $CACHE_SUBDIR packages"
-                    fi
+                    log_info "Removing $PACKAGE_COUNT old packages from $CACHE_SUBDIR cache ($PACKAGE_SIZE)"
+                    echo "$OLD_PACKAGES" | xargs rm -f 2>/dev/null || true
+                    log_success "Removed old $CACHE_SUBDIR packages"
                 fi
             fi
         done
@@ -736,6 +723,66 @@ clean_orphaned_node_modules() {
     fi
 }
 
+# Function to clean system logs and journals
+clean_system_logs() {
+    log_info "Checking system logs and journals..."
+
+    # Clean systemd journal logs (auto-clean to 100MB)
+    if command -v journalctl &> /dev/null; then
+        log_info "Cleaning systemd journals to 100MB..."
+        journalctl --vacuum-size=100M 2>/dev/null || true
+        journalctl --vacuum-time=7d 2>/dev/null || true
+        log_success "Cleaned systemd journals"
+    fi
+
+    # Clean APT logs and cache automatically
+    if command -v apt-get &> /dev/null; then
+        log_info "Cleaning APT cache and logs..."
+        apt-get clean 2>/dev/null || true
+        apt-get autoremove -y 2>/dev/null || true
+        
+        # Clean old apt logs
+        if [ -d "/var/log/apt" ]; then
+            find /var/log/apt -name "*.log.*" -delete 2>/dev/null || true
+        fi
+        log_success "Cleaned APT cache and logs"
+    fi
+
+    # Clean other system logs
+    if [ -d "/var/log" ]; then
+        # Clean rotated logs
+        find /var/log -name "*.gz" -delete 2>/dev/null || true
+        find /var/log -name "*.old" -delete 2>/dev/null || true
+        find /var/log -regex ".*\.[1-9]$" -delete 2>/dev/null || true
+        
+        # Only truncate extremely large logs (>500MB) and ask first
+        LARGE_LOGS=$(find /var/log -name "*.log" -size +500M 2>/dev/null)
+        if [ -n "$LARGE_LOGS" ]; then
+            LOG_COUNT=$(echo "$LARGE_LOGS" | wc -l)
+            if confirm_action "Found $LOG_COUNT very large log files (>500MB). Truncate to 50MB?"; then
+                echo "$LARGE_LOGS" | xargs -I {} truncate -s 50M {} 2>/dev/null || true
+                log_success "Truncated very large log files"
+            fi
+        fi
+        log_success "Cleaned system logs"
+    fi
+}
+
+# Function to clean Wrangler temp files
+clean_wrangler_temp() {
+    log_info "Checking Wrangler temp files..."
+    
+    WRANGLER_TEMP="$HOME/.config/.wrangler/tmp"
+    if [ -d "$WRANGLER_TEMP" ]; then
+        TEMP_SIZE=$(get_size "$WRANGLER_TEMP")
+        if [[ "$TEMP_SIZE" != "0" ]]; then
+            log_info "Removing Wrangler temp files: $TEMP_SIZE"
+            rm -rf "$WRANGLER_TEMP"/* 2>/dev/null || true
+            log_success "Cleared Wrangler temp files"
+        fi
+    fi
+}
+
 # Function to find large files
 find_large_files() {
     log_info "Looking for large files in $HOME..."
@@ -745,6 +792,9 @@ find_large_files() {
 
     echo -e "\n${YELLOW}Large directories:${NC}"
     du -h --max-depth=2 "$HOME" 2>/dev/null | sort -rh | head -15
+
+    echo -e "\n${YELLOW}Quick cleanup command (if you want to run manually):${NC}"
+    echo "rm -rf ~/.cache/ms-playwright/* ~/.cache/code-server/* ~/.cache/claude/* && npm cache clean --force && sudo apt-get clean && sudo journalctl --vacuum-size=100M"
 }
 
 # Main execution
@@ -757,18 +807,22 @@ main() {
     df -h /
     echo
 
-    # Run cleanup functions
-    clean_vscode_server
+    # Run cleanup functions (more aggressive order)
+    clean_cached_installers  # Includes Playwright, code-server, Claude caches
+    echo
+    clean_vscode_server      # Now more aggressive auto-cleanup
+    echo
+    clean_system_logs        # New: system logs and journals
     echo
     clean_npm_cache
     echo
     clean_package_caches
     echo
-    clean_dev_tools
-    echo
     clean_wrangler_logs
     echo
-    clean_cached_installers
+    clean_wrangler_temp      # New: Wrangler temp files
+    echo
+    clean_dev_tools
     echo
     clean_orphaned_node_modules
     echo
