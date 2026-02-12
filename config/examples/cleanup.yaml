@@ -1,0 +1,14 @@
+# Cleanup utility configuration
+# Place at ~/.config/tools/cleanup.yaml for automatic loading
+
+# Retention settings
+log_retention_days: 7
+backup_retention_days: 30
+
+# Target toggles — set to false to skip
+vscode_enabled: true
+nodejs_enabled: true
+docker_enabled: true
+system_enabled: true
+wrangler_enabled: true
+dev_tools_enabled: true

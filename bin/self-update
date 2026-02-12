@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Self-update: pull latest changes and re-run installer
+set -euo pipefail
+
+TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Colors
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+info() { echo -e "${BLUE}::${NC} $*"; }
+ok()   { echo -e "${GREEN}::${NC} $*"; }
+err()  { echo -e "${RED}ERROR:${NC} $*" >&2; }
+
+if [[ ! -d "$TOOLS_DIR/.git" ]]; then
+    err "Not a git repository: $TOOLS_DIR"
+    err "Self-update requires a git-based installation."
+    exit 1
+fi
+
+info "Updating tools from $(git -C "$TOOLS_DIR" remote get-url origin 2>/dev/null || echo 'local repo')..."
+
+# Stash any local changes
+local_changes=false
+if ! git -C "$TOOLS_DIR" diff --quiet 2>/dev/null; then
+    info "Stashing local changes..."
+    git -C "$TOOLS_DIR" stash push -m "self-update $(date +%Y%m%d-%H%M%S)" --quiet
+    local_changes=true
+fi
+
+# Pull latest
+if git -C "$TOOLS_DIR" pull --rebase --quiet 2>/dev/null; then
+    ok "Pulled latest changes"
+else
+    err "Git pull failed. Check your network or remote configuration."
+    if [[ "$local_changes" == true ]]; then
+        git -C "$TOOLS_DIR" stash pop --quiet 2>/dev/null || true
+    fi
+    exit 1
+fi
+
+# Restore local changes
+if [[ "$local_changes" == true ]]; then
+    info "Restoring local changes..."
+    git -C "$TOOLS_DIR" stash pop --quiet 2>/dev/null || {
+        err "Could not auto-restore local changes. Run 'git -C $TOOLS_DIR stash pop' manually."
+    }
+fi
+
+# Re-run installer
+info "Re-running installer..."
+"$TOOLS_DIR/install.sh" install
+
+ok "Update complete!"

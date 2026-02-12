@@ -13,9 +13,32 @@ SESSION_NAME=""
 TIMEZONE_SCRIPT=""
 VERBOSE="${VERBOSE:-false}"
 
+# Runtime directory for temp files (avoid hardcoded /tmp)
+TOOLS_RUNTIME_DIR="${XDG_RUNTIME_DIR:-${HOME}/.cache/tools}/session"
+mkdir -p "$TOOLS_RUNTIME_DIR" 2>/dev/null || true
+
 # Logging functions
 log() { [[ "$VERBOSE" == "true" ]] && echo ":: $*" >&2 || true; }
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Wait for a tmux target to become ready (pane exists and is responsive).
+# Falls back to a short sleep if polling fails, with a bounded retry.
+wait_for_target() {
+    local target="$1"
+    local max_attempts="${2:-20}"  # 20 × 50ms = 1s max
+    local i=0
+    while [[ $i -lt $max_attempts ]]; do
+        tmux display-message -t "$target" -p "#{pane_id}" &>/dev/null && return 0
+        sleep 0.05
+        ((i++))
+    done
+    log "Timed out waiting for $target"
+}
+
+# Signal-based wait using tmux wait-for.
+# Usage: tmux_signal "channel" & tmux_wait "channel"
+tmux_signal() { tmux wait-for -S "$1" 2>/dev/null || true; }
+tmux_wait()   { tmux wait-for "$1" 2>/dev/null || sleep 0.2; }
 
 # Find session configuration file
 find_session_config() {
@@ -71,12 +94,52 @@ load_session_config() {
         die "Session name not defined in configuration"
     fi
 
+    # Validate windows exist
+    local window_list
+    window_list=$(yaml_get_windows)
+    if [[ -z "$window_list" ]]; then
+        die "No windows defined in configuration"
+    fi
+
+    # Validate each window has at least one pane
+    while IFS= read -r wname; do
+        [[ -z "$wname" ]] && continue
+        local pc
+        pc=$(yaml_get_pane_count "$wname")
+        if [[ "$pc" -eq 0 ]]; then
+            die "Window '$wname' has no panes defined"
+        fi
+    done <<< "$window_list"
+
+    # Validate subsession references in panes point to defined subsessions
+    while IFS= read -r wname; do
+        [[ -z "$wname" ]] && continue
+        local pc
+        pc=$(yaml_get_pane_count "$wname")
+        for ((pi=0; pi<pc; pi++)); do
+            local ptype
+            ptype=$(yaml_get_pane "$wname" "$pi" "type")
+            if [[ "$ptype" == "subsession" ]]; then
+                local sref
+                sref=$(yaml_get_pane "$wname" "$pi" "subsession")
+                if [[ -z "$sref" ]]; then
+                    die "Window '$wname' pane $pi: subsession type but no subsession name specified"
+                fi
+                local sdir
+                sdir=$(yaml_get_subsession "$sref" "dir")
+                if [[ -z "$sdir" ]]; then
+                    die "Subsession '$sref' referenced in window '$wname' is not defined in subsessions section"
+                fi
+            fi
+        done
+    done <<< "$window_list"
+
     log "Loaded session: $SESSION_NAME"
 }
 
 # Create timezone script for status bar
 create_timezone_script() {
-    local script="/tmp/${SESSION_NAME}-time.sh"
+    local script="${TOOLS_RUNTIME_DIR}/${SESSION_NAME}-time.sh"
     local primary_tz=$(yaml_get "timezone")
     local show_utc=$(yaml_get "show_utc")
 
@@ -107,7 +170,7 @@ EOF
 create_tmux_config() {
     local timezone_script="$1"
 
-    cat > /tmp/session-tmux.conf << EOF
+    cat > ${TOOLS_RUNTIME_DIR}/session-tmux.conf << EOF
 # Session Manager tmux configuration
 set -g default-terminal "tmux-256color"
 set -ga terminal-overrides ",*256col*:Tc"
@@ -147,10 +210,10 @@ EOF
     window_count=$(yaml_get_windows | wc -l)
     local max=$((window_count > 20 ? 20 : window_count))
     for ((i=1; i<=max; i++)); do
-        echo "bind -n M-$i select-window -t $i" >> /tmp/session-tmux.conf
+        echo "bind -n M-$i select-window -t $i" >> ${TOOLS_RUNTIME_DIR}/session-tmux.conf
     done
 
-    cat >> /tmp/session-tmux.conf << 'EOF'
+    cat >> ${TOOLS_RUNTIME_DIR}/session-tmux.conf << 'EOF'
 
 # Quick window switching
 bind -n M-n next-window
@@ -175,18 +238,7 @@ apply_session_colors() {
     local session_color=$(yaml_get "color")
     [[ -z "$session_color" ]] && return
 
-    # Convert simple color names to tmux colors
-    case "$session_color" in
-        red) session_color="colour196" ;;
-        green) session_color="colour46" ;;
-        blue) session_color="colour33" ;;
-        yellow) session_color="colour226" ;;
-        orange) session_color="colour202" ;;
-        purple|magenta) session_color="colour201" ;;
-        cyan) session_color="colour51" ;;
-    esac
-
-    sleep 0.1
+    wait_for_target "$session_name"
     tmux set-option -g status-style "default"
     tmux set-option -t "$session_name" status-style "fg=white,bg=${session_color}"
     tmux set-option -t "$session_name" status-left "#[fg=white,bg=${session_color},bold]  #S  #[default]   "
@@ -208,7 +260,6 @@ create_pane_layout() {
     local height=$(tmux display-message -t "$target" -p "#{window_height}")
     if [[ $width -lt 20 || $height -lt 10 ]]; then
         tmux resize-window -t "$target" -x 80 -y 24 2>/dev/null || true
-        sleep 0.1
     fi
 
     case $pane_count in
@@ -229,13 +280,12 @@ create_pane_layout() {
         *)
             for ((i=1; i<pane_count; i++)); do
                 tmux split-window -v -t "$target" -c "$working_dir" 2>/dev/null || break
-                sleep 0.1
             done
             tmux select-layout -t "$target" tiled 2>/dev/null || true
             ;;
     esac
 
-    sleep 0.1
+    wait_for_target "$target"
     local actual=$(tmux list-panes -t "$target" | wc -l)
     log "Window $target: requested $pane_count, created $actual panes"
 }
@@ -254,7 +304,7 @@ setup_pane() {
             local subsession_name=$(yaml_get_pane "$window_name" "$pane_index" "subsession")
             if [[ -n "$subsession_name" ]]; then
                 ensure_subsession "$subsession_name"
-                sleep 0.1
+                wait_for_target "$pane_target"
                 attach_pane_to_subsession "$pane_target" "$subsession_name"
             fi
             ;;
@@ -308,16 +358,6 @@ create_window() {
 
     # Apply window colors
     if [[ -n "$window_color" ]]; then
-        case "$window_color" in
-            red) window_color="colour196" ;;
-            green) window_color="colour46" ;;
-            blue) window_color="colour33" ;;
-            yellow) window_color="colour226" ;;
-            orange) window_color="colour202" ;;
-            purple|magenta) window_color="colour201" ;;
-            cyan) window_color="colour51" ;;
-        esac
-
         tmux set-window-option -t "$session_name:$window_name" window-status-current-style "fg=black,bg=$window_color,bold"
         tmux set-window-option -t "$session_name:$window_name" window-status-style "fg=$window_color,bg=default"
     fi
@@ -328,7 +368,7 @@ create_window() {
         create_pane_layout "$session_name:$window_name" "$pane_count" "$window_dir"
     fi
 
-    sleep 0.2
+    wait_for_target "$session_name:$window_name"
 
     # Phase 1: Setup direct command panes (not subsessions)
     for ((i=0; i<pane_count; i++)); do
@@ -350,7 +390,6 @@ attach_window_subsessions() {
         local pane_type=$(yaml_get_pane "$window_name" "$i" "type")
         if [[ "$pane_type" == "subsession" ]]; then
             setup_pane "$session_name:$window_name" "$i" "$window_name"
-            sleep 0.05
         fi
     done
 }
@@ -422,7 +461,7 @@ start_session() {
     done < <(yaml_get_subsessions)
 
     # Create main session
-    tmux -f /tmp/session-tmux.conf new-session -d -s "$SESSION_NAME"
+    tmux -f ${TOOLS_RUNTIME_DIR}/session-tmux.conf new-session -d -s "$SESSION_NAME"
     tmux set-option -u window-size 2>/dev/null || true
     exclude_from_resurrect "$SESSION_NAME"
     apply_session_colors "$SESSION_NAME" "$TIMEZONE_SCRIPT"
@@ -437,7 +476,7 @@ start_session() {
 
     # Phase 2: Attach subsessions to panes (after windows are stable)
     log "Attaching subsessions to stable windows..."
-    sleep 0.3
+    wait_for_target "$SESSION_NAME:1"
     while IFS= read -r window_name; do
         [[ -z "$window_name" ]] && continue
         attach_window_subsessions "$SESSION_NAME" "$window_name"
@@ -472,7 +511,7 @@ stop_session() {
         log "Session not running: $SESSION_NAME"
     fi
 
-    rm -f /tmp/session-tmux.conf "/tmp/${SESSION_NAME}-time.sh"
+    rm -f ${TOOLS_RUNTIME_DIR}/session-tmux.conf "${TOOLS_RUNTIME_DIR}/${SESSION_NAME}-time.sh"
 }
 
 # Show session status
@@ -544,5 +583,5 @@ kill_all_sessions() {
     fi
 
     log "All sessions terminated"
-    rm -f /tmp/session-tmux.conf "/tmp/${SESSION_NAME}-time.sh"
+    rm -f ${TOOLS_RUNTIME_DIR}/session-tmux.conf "${TOOLS_RUNTIME_DIR}/${SESSION_NAME}-time.sh"
 }

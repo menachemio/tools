@@ -23,9 +23,12 @@ Thumbs.db
 *.pid
 *.log
 
-# Personal config files (users should create their own)
+# Personal config files
 config/personal/
 *.personal.*
+
+# Claude Code artifacts
+.claude/
 
 # Cache and build artifacts
 *.cache

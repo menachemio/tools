@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Subsession Manager - Smart tmux subsession management
 
-# Source common utilities
-source "$(dirname "${BASH_SOURCE[0]}")/../common/yaml-parser.sh"
+# yaml-parser.sh is sourced by core.sh before this file
 
 # Global subsession tracking
 declare -A ACTIVE_SUBSESSIONS
@@ -22,6 +21,11 @@ start_subsession() {
 
     if subsession_exists "$name"; then
         return 0
+    fi
+
+    if [[ ! -d "$dir" ]]; then
+        log "Directory does not exist for subsession '$name': $dir"
+        return 1
     fi
 
     if ! tmux new-session -d -s "$name" -c "$dir" 2>/dev/null; then
@@ -181,13 +185,6 @@ apply_subsession_colors() {
 
     [[ -z "$color" ]] && return
     subsession_exists "$name" || return
-
-    # Convert simple names
-    case "$color" in
-        red) color="colour196" ;; green) color="colour46" ;; blue) color="colour33" ;;
-        yellow) color="colour226" ;; orange) color="colour202" ;;
-        purple|magenta) color="colour201" ;; cyan) color="colour51" ;;
-    esac
 
     tmux set-option -t "$name" status-style "fg=${color},bg=default"
     tmux set-option -t "$name" status-left "#[fg=${color},bold] #S #[default]"

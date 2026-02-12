@@ -1,8 +1,8 @@
-# Microservices project session configuration  
+# Microservices project session configuration
 name: microservices
 timezone: America/New_York
 show_utc: true
-color: orange
+color: colour202
 
 subsessions:
   auth-service:
@@ -18,26 +18,26 @@ subsessions:
     dir: ./services/users
     command: npm run dev
     delay: 3
-  
+
   database:
     dir: ./
     command: docker-compose up -d postgres redis
 
 windows:
   - name: services
-    color: cyan
+    color: colour51
     panes:
       - type: subsession
         subsession: auth-service
-      - type: subsession  
+      - type: subsession
         subsession: api-gateway
       - type: subsession
         subsession: user-service
       - type: subsession
         subsession: database
-  
+
   - name: monitoring
-    color: red
+    color: colour196
     panes:
       - type: command
         cmd: "watch docker ps"
@@ -46,9 +46,9 @@ windows:
         cmd: "docker-compose logs -f"
         execute: false
         history: true
-  
+
   - name: development
-    color: green
+    color: colour46
     panes:
       - type: command
         cmd: nvim

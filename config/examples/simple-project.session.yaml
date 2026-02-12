@@ -2,7 +2,7 @@
 name: simple-project
 timezone: America/New_York
 show_utc: true
-color: blue
+color: colour33
 
 subsessions:
   backend:
@@ -17,7 +17,7 @@ subsessions:
 windows:
   - name: dev
     dir: .
-    color: green
+    color: colour46
     panes:
       - type: command
         cmd: nvim
@@ -28,7 +28,7 @@ windows:
         subsession: frontend
   
   - name: tools
-    color: yellow
+    color: colour226
     panes:
       - type: command
         cmd: "git status"

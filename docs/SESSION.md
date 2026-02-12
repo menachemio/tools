@@ -1,6 +1,6 @@
-# Session Manager Documentation
+# Session Manager
 
-The Session Manager provides YAML-based tmux session management with smart subsession handling.
+YAML-based tmux session management with smart subsession handling.
 
 ## Overview
 
@@ -9,41 +9,36 @@ The session manager separates **what runs** (subsessions) from **how it's displa
 - Independent subsession lifecycle management
 - Flexible window layouts that reference subsessions
 - Direct subsession access for development workflow
-- Resilient session recovery and restart capabilities
+- Resilient session recovery and restart
 
-## Configuration Format
+## Configuration
 
-Session configurations use YAML format with `.session.yaml` extension.
-
-### Basic Structure
+Session configs use YAML with any filename. The `name` field inside the YAML is authoritative.
 
 ```yaml
-# Session metadata
 name: myproject
 timezone: America/New_York
 show_utc: true
-color: blue
+color: colour33                  # Any valid tmux colour value
 
-# Define what can run independently
 subsessions:
   backend:
-    dir: ./api
+    dir: ./api                   # Resolved relative to config file
     command: npm run dev
     env: |
       PORT=3000
       NODE_ENV=development
     delay: 0
-  
+
   frontend:
     dir: ./web
     command: npm start
     delay: 10
 
-# Define how things are displayed  
 windows:
   - name: dev
     dir: .
-    color: green
+    color: colour46
     panes:
       - type: command
         cmd: nvim
@@ -54,82 +49,61 @@ windows:
         subsession: frontend
 ```
 
-### Configuration Discovery
+### Config discovery
 
-The session manager searches for configurations in this order:
+When running `session <name>` without an installed wrapper:
 
-1. `./[session-name].session.yaml` - Project-specific config
-2. `./.session.yaml` - Generic project config
-3. `./.session/config.yaml` - Hidden config directory
-4. `~/.config/tools/sessions/[session-name].yaml` - User config directory
+1. `./<name>.session.yaml`
+2. `./.session.yaml`
+3. `./.session/config.yaml`
+4. `~/.config/tools/sessions/<name>.yaml`
 
-## Command Interface
+When running an installed command (e.g. `myproject`), the wrapper passes the config path directly. Filename doesn't matter.
 
-### Basic Usage
+### Register a project
 
 ```bash
-# Start/attach to main session
-session myproject
-
-# Start session in background
-session myproject --headless
-
-# Start/attach to specific subsession
-session myproject backend
-
-# Start subsession in background
-session myproject backend --headless
+session install /any/path/whatever.yaml
+# Reads name: from inside the YAML, creates ~/.local/bin/<name>
 ```
 
-### Session Management
+## Commands
 
 ```bash
-session myproject status          # Show session status
-session myproject stop            # Stop main session (keep subsessions)
-session myproject kill            # Kill all sessions (with confirmation)
-session myproject restart         # Restart entire session
-session myproject restart backend # Restart specific subsession
+session myproject                    # Start/attach
+session myproject --headless         # Start in background
+session myproject backend            # Attach to subsession
+session myproject backend --headless # Start subsession in background
+session myproject status             # Show all sessions
+session myproject stop               # Stop main (keep subsessions)
+session myproject kill               # Kill everything (with confirm)
+session myproject restart            # Restart entire session
+session myproject restart backend    # Restart one subsession
 ```
 
 ## Subsessions
 
-Subsessions are independent tmux sessions that can run with or without windows attached.
-
-### Subsession Configuration
+Independent tmux sessions that persist across window operations.
 
 ```yaml
 subsessions:
   api-server:
-    dir: ./api                    # Working directory
-    command: npm run dev          # Command to run
-    delay: 5                      # Wait 5 seconds before starting
-    env: |                        # Environment variables
+    dir: ./api
+    command: npm run dev
+    delay: 5
+    env: |
       PORT=3000
       NODE_ENV=development
-      DEBUG=*
 ```
 
-### Subsession Lifecycle
-
-- **Auto-start**: Subsessions start automatically when referenced by windows
+- **Auto-start**: Created when referenced by windows
 - **Independent**: Run without windows attached
 - **Persistent**: Continue running even if windows close
-- **Resumable**: Attach/detach from subsessions freely
+- **Resumable**: Attach/detach freely
 
-### Direct Subsession Access
+## Pane types
 
-```bash
-session myproject api-server      # Attach to api-server subsession
-session myproject api-server --headless  # Start without attaching
-```
-
-## Windows and Panes
-
-Windows define the tmux layout and how subsessions/commands are displayed.
-
-### Pane Types
-
-#### Command Panes
+### Command panes
 
 ```yaml
 panes:
@@ -137,255 +111,79 @@ panes:
     cmd: nvim
     execute: true       # Run immediately
     history: true       # Add to bash history
-  
-  - type: command  
+
+  - type: command
     cmd: "git status"
-    execute: false      # Type but don't run (wait for Enter)
-    history: false      # Don't add to history
+    execute: false      # Pre-fill only, wait for Enter
 ```
 
-#### Subsession Panes
+### Subsession panes
 
 ```yaml
 panes:
   - type: subsession
-    subsession: backend   # Reference to subsession name
+    subsession: backend
 ```
 
-### Window Layouts
+## Layouts
 
-Pane layouts are automatically determined by pane count:
+Automatic by pane count:
 
-- **1 pane**: Full window
-- **2 panes**: 50% horizontal split
-- **3 panes**: Left 50% | Right top 25% | Right bottom 25%
-- **4 panes**: 25% each in 2x2 grid
-- **5+ panes**: Tiled layout
+- **1**: Full window
+- **2**: 50/50 horizontal split
+- **3**: Left 50% | right top/bottom
+- **4**: 2x2 tiled grid
+- **5+**: Tiled layout
 
-### Window Colors
+## Colors
+
+Colors must be valid tmux colour values. Examples:
 
 ```yaml
-windows:
-  - name: development
-    color: green        # Simple color name
-    # or
-    color: colour46     # Tmux color code
+color: colour33     # Blue
+color: colour196    # Red
+color: colour46     # Green
+color: colour226    # Yellow
+color: colour202    # Orange
+color: colour51     # Cyan
+color: white
+color: default
 ```
 
-Supported color names: `red`, `green`, `blue`, `yellow`, `orange`, `purple`, `cyan`
+Run `tmux show -s | grep default-terminal` to check your terminal's color support. Use `colour0`-`colour255` for 256-color mode.
 
-## Advanced Features
-
-### Headless Mode
-
-Start everything in background without attaching:
-
-```bash
-session myproject --headless
-```
-
-This:
-- Starts all defined subsessions
-- Creates main session with windows
-- Runs in background (no tmux attachment)
-- Later use `session myproject` to attach
-
-### Session Colors and Theming
+## Timezone display
 
 ```yaml
-# Session-level color (master session status bar)
-color: orange
-
-windows:
-  - name: api
-    color: blue     # Window tab color
-  - name: web
-    color: green
-```
-
-### Timezone Display
-
-```yaml
-timezone: America/New_York    # Primary timezone
-show_utc: true               # Also show UTC time
+timezone: America/New_York
+show_utc: true
 ```
 
 Status bar shows: `14:30 EST [19:30 UTC]`
 
-### Environment Variables
+## Validation
 
-```yaml
-subsessions:
-  backend:
-    env: |
-      PORT=3000
-      NODE_ENV=development
-      DEBUG=api:*
-      DATABASE_URL=postgresql://localhost/mydb
-```
+The session manager validates configs before creating anything:
 
-## Migration from Bash Configs
-
-Convert existing bash session configs:
-
-```bash
-# Convert single config
-tools/scripts/migrate-to-yaml.sh old-config.sh new-config.yaml
-
-# The migration script will:
-# - Extract session metadata
-# - Convert windows and panes
-# - Identify subsessions
-# - Generate YAML equivalent
-```
-
-## Examples
-
-### Simple Web Development
-
-```yaml
-name: webapp
-color: blue
-
-subsessions:
-  server:
-    dir: ./backend
-    command: npm run dev
-  
-  client:
-    dir: ./frontend
-    command: npm start
-    delay: 5
-
-windows:
-  - name: code
-    panes:
-      - type: command
-        cmd: nvim
-        execute: true
-      - type: subsession
-        subsession: server
-      - type: subsession
-        subsession: client
-```
-
-### Microservices Project
-
-```yaml
-name: microservices  
-color: orange
-
-subsessions:
-  auth:
-    dir: ./auth-service
-    command: go run main.go
-    env: |
-      PORT=8001
-  
-  gateway:
-    dir: ./api-gateway
-    command: npm run dev
-    env: |
-      PORT=8000
-    delay: 3
-  
-  database:
-    dir: .
-    command: docker-compose up -d
-
-windows:
-  - name: services
-    panes:
-      - type: subsession
-        subsession: auth
-      - type: subsession
-        subsession: gateway
-      - type: subsession
-        subsession: database
-      - type: command
-        cmd: "docker ps"
-        execute: false
-
-  - name: monitoring
-    panes:
-      - type: command
-        cmd: "watch docker stats"
-        execute: true
-      - type: command
-        cmd: htop
-        execute: true
-```
-
-## Tips and Best Practices
-
-1. **Project-specific configs**: Keep `.session.yaml` in project root
-2. **Subsession naming**: Use descriptive names like `api-server`, `web-client`
-3. **Delay coordination**: Stagger subsession starts with `delay` for dependencies
-4. **Environment isolation**: Use `env` block for subsession-specific variables
-5. **Headless development**: Use `--headless` for CI/CD or server environments
-6. **Direct subsession access**: Use `session project subsession` for focused development
+- `name` field must exist
+- At least one window required
+- Each window must have at least one pane
+- Subsession pane references must point to defined subsessions
+- Directories must exist before subsession creation
 
 ## Troubleshooting
 
-### Subsessions Not Starting
-
-Check subsession status:
 ```bash
+# Check what's running
 session myproject status
-```
 
-Restart specific subsession:
-```bash
+# Restart a stuck subsession
 session myproject restart backend
-```
 
-### Layout Issues
+# Verbose output
+session myproject --verbose
 
-Ensure terminal size is adequate (minimum 80x24 recommended).
-
-### Configuration Errors
-
-Test YAML parsing:
-```bash
-session myproject --help  # Will show config parsing errors
-```
-
-### Clipboard Integration
-
-The session manager automatically detects available clipboard tools:
-- Linux: `xclip` or `wl-clipboard`
-- macOS: `pbcopy`
-- WSL: Windows clipboard
-
-## Integration
-
-### With IDEs
-
-Configure your IDE to use session manager:
-```bash
-# VS Code integrated terminal
-session myproject backend
-
-# Attach to running subsession
-session myproject api-server
-```
-
-### With Git Hooks
-
-```bash
-# In .git/hooks/post-checkout
-#!/bin/bash
-session myproject --headless
-```
-
-### With Docker
-
-```yaml
-subsessions:
-  database:
-    command: docker-compose up postgres
-  
-  redis:
-    command: docker-compose up redis
-    delay: 2
+# Kill everything and start fresh
+echo y | session myproject kill
+session myproject
 ```

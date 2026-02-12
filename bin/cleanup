@@ -1,853 +1,183 @@
 #!/bin/bash
-
-# System Cleanup Script
-# This script safely removes unnecessary files to free up disk space
+# Cleanup Utility — modular system cleanup with YAML config support
+# Usage: cleanup [--dry-run] [--auto] [--config <file>] [--update]
 
 set -euo pipefail
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# Resolve paths
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib/cleanup"
 
-# Track total space freed
-INITIAL_USAGE=$(df / | awk 'NR==2 {print $3}')
-FREED_SPACE=0
+# Source modules
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/config.sh"
+source "$LIB_DIR/vscode.sh"
+source "$LIB_DIR/nodejs.sh"
+source "$LIB_DIR/system.sh"
+source "$LIB_DIR/dev-tools.sh"
+source "$LIB_DIR/updates.sh"
 
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+# CLI flags
+CONFIG_FILE=""
+RUN_UPDATES=false
+
+show_help() {
+    cat << 'EOF'
+Cleanup Utility — intelligent system cleaning
+
+Usage:
+  cleanup                     Interactive cleanup with prompts
+  cleanup --dry-run           Preview what would be cleaned
+  cleanup --auto              Auto-clean safe targets (no prompts)
+  cleanup --config <file>     Use YAML configuration file
+  cleanup --update            Also run system/tool updates
+  cleanup --verbose           Show detailed output
+  cleanup --help              Show this help
+
+Flags can be combined:
+  cleanup --dry-run --update  Preview cleanup + updates
+  cleanup --auto --config ~/.config/tools/cleanup.yaml
+
+Config lookup:
+  1. --config <file>           Explicit path
+  2. $CLEANUP_CONFIG            Environment variable
+  3. ~/.config/tools/cleanup.yaml  Default location
+EOF
 }
 
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)   DRY_RUN=true ;;
+            --auto)      AUTO_MODE=true ;;
+            --verbose)   VERBOSE=true ;;
+            --update)    RUN_UPDATES=true ;;
+            --config)
+                shift
+                CONFIG_FILE="${1:-}"
+                [[ -z "$CONFIG_FILE" ]] && { log_error "Missing config file path"; exit 1; }
+                ;;
+            --help|-h|help)
+                show_help
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+        shift
+    done
 }
 
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-get_size() {
-    if [ -d "$1" ] || [ -f "$1" ]; then
-        du -sh "$1" 2>/dev/null | cut -f1 || echo "0"
-    else
-        echo "0"
-    fi
-}
-
-confirm_action() {
-    read -p "$1 (y/n): " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Yy]$ ]]
-}
-
-# Function to clean VS Code Server files
-clean_vscode_server() {
-    log_info "Checking VS Code Server files..."
-
-    VSCODE_DIR="$HOME/.vscode-server"
-    if [ -d "$VSCODE_DIR" ]; then
-        SIZE=$(get_size "$VSCODE_DIR")
-        log_info "VS Code Server is using: $SIZE"
-
-        # More aggressive cleanup - remove old extensions automatically
-        if [ -d "$VSCODE_DIR/extensions" ]; then
-            log_info "Cleaning old extension versions..."
-
-            # Get list of extensions with multiple versions
-            OLD_EXTENSIONS=""
-            for ext_base in $(ls "$VSCODE_DIR/extensions" | sed -E 's/-[0-9]+\.[0-9]+.*//' | sort -u); do
-                # Find all versions of this extension
-                versions=($(ls -d "$VSCODE_DIR/extensions/$ext_base"* 2>/dev/null | sort -V))
-
-                # If more than one version exists, mark all but the latest for deletion
-                if [ ${#versions[@]} -gt 1 ]; then
-                    for ((i=0; i<${#versions[@]}-1; i++)); do
-                        OLD_EXTENSIONS="$OLD_EXTENSIONS${versions[$i]}\n"
-                    done
-                fi
-            done
-
-            if [ -n "$OLD_EXTENSIONS" ]; then
-                OLD_EXT_COUNT=$(echo -e "$OLD_EXTENSIONS" | grep -c "^/")
-                OLD_EXT_SIZE=$(echo -e "$OLD_EXTENSIONS" | xargs -I {} du -sh {} 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                log_info "Removing $OLD_EXT_COUNT old extension versions ($OLD_EXT_SIZE)"
-                echo -e "$OLD_EXTENSIONS" | while read -r ext_dir; do
-                    if [ -n "$ext_dir" ] && [ -d "$ext_dir" ]; then
-                        rm -rf "$ext_dir"
-                    fi
-                done
-                log_success "Removed old extension versions"
-            fi
-        fi
-
-        # Auto-clean CLI folder
-        if [ -d "$VSCODE_DIR/cli" ]; then
-            CLI_SIZE=$(get_size "$VSCODE_DIR/cli")
-            if [[ "$CLI_SIZE" != "0" ]]; then
-                log_info "Removing VS Code CLI folder: $CLI_SIZE"
-                rm -rf "$VSCODE_DIR/cli"
-                log_success "Cleared VS Code CLI folder"
-            fi
-        fi
-
-        # Auto-clean old code installations
-        OLD_SERVERS=$(find "$VSCODE_DIR" -maxdepth 1 -name "code-*" -type d 2>/dev/null)
-        if [ -n "$OLD_SERVERS" ]; then
-            SERVER_COUNT=$(echo "$OLD_SERVERS" | wc -l)
-            SERVER_SIZE=$(echo "$OLD_SERVERS" | xargs du -sh 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-            log_info "Removing $SERVER_COUNT old server installation(s) ($SERVER_SIZE)"
-            echo "$OLD_SERVERS" | xargs rm -rf 2>/dev/null || true
-            log_success "Removed old server installations"
-        fi
-
-        # Clean data folder components (CONSERVATIVE - keep settings)
-        if [ -d "$VSCODE_DIR/data" ]; then
-            # Only clean safe cache directories
-            for cache_dir in CachedData CachedExtensionVSIXs; do
-                if [ -d "$VSCODE_DIR/data/$cache_dir" ]; then
-                    CACHE_SIZE=$(get_size "$VSCODE_DIR/data/$cache_dir")
-                    if [[ "$CACHE_SIZE" != "0" ]]; then
-                        log_info "Clearing VS Code $cache_dir: $CACHE_SIZE"
-                        rm -rf "$VSCODE_DIR/data/$cache_dir"
-                        mkdir -p "$VSCODE_DIR/data/$cache_dir"
-                        log_success "Cleared $cache_dir"
-                    fi
-                fi
-            done
-
-            # Conservative log cleanup - keep recent logs (last 7 days)
-            if [ -d "$VSCODE_DIR/data/logs" ]; then
-                OLD_LOGS=$(find "$VSCODE_DIR/data/logs" -maxdepth 1 -type d -mtime +7 2>/dev/null)
-                if [ -n "$OLD_LOGS" ]; then
-                    OLD_COUNT=$(echo "$OLD_LOGS" | wc -l)
-                    LOG_SIZE=$(echo "$OLD_LOGS" | xargs du -sh 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                    log_info "Removing $OLD_COUNT old VS Code log folders ($LOG_SIZE)"
-                    echo "$OLD_LOGS" | xargs rm -rf 2>/dev/null || true
-                    log_success "Cleaned old VS Code logs"
-                fi
-            fi
-
-            # Conservative User folder cleanup
-            if [ -d "$VSCODE_DIR/data/User" ]; then
-                # Only clean safe caches, not all caches
-                CACHE_DIRS=("caches/workbench" "caches/chromium")
-                for cache_subdir in "${CACHE_DIRS[@]}"; do
-                    if [ -d "$VSCODE_DIR/data/User/$cache_subdir" ]; then
-                        CACHE_SIZE=$(get_size "$VSCODE_DIR/data/User/$cache_subdir")
-                        if [[ "$CACHE_SIZE" != "0" ]]; then
-                            log_info "Clearing VS Code $cache_subdir: $CACHE_SIZE"
-                            rm -rf "$VSCODE_DIR/data/User/$cache_subdir"
-                            mkdir -p "$VSCODE_DIR/data/User/$cache_subdir"
-                            log_success "Cleared $cache_subdir"
-                        fi
-                    fi
-                done
-
-                # Only clean old History (keep recent)
-                if [ -d "$VSCODE_DIR/data/User/History" ]; then
-                    OLD_HISTORY=$(find "$VSCODE_DIR/data/User/History" -maxdepth 1 -type d -mtime +30 2>/dev/null)
-                    if [ -n "$OLD_HISTORY" ]; then
-                        HISTORY_COUNT=$(echo "$OLD_HISTORY" | wc -l)
-                        HISTORY_SIZE=$(echo "$OLD_HISTORY" | xargs du -sh 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                        if confirm_action "Remove $HISTORY_COUNT old VS Code history folders ($HISTORY_SIZE)?"; then
-                            echo "$OLD_HISTORY" | xargs rm -rf 2>/dev/null || true
-                            log_success "Cleaned old VS Code history"
-                        fi
-                    fi
-                fi
-
-                # Conservative backup cleanup - only very old backups
-                if [ -d "$VSCODE_DIR/data/User/Backups" ]; then
-                    OLD_BACKUPS=$(find "$VSCODE_DIR/data/User/Backups" -maxdepth 1 -type d -mtime +30 2>/dev/null)
-                    if [ -n "$OLD_BACKUPS" ]; then
-                        BACKUP_COUNT=$(echo "$OLD_BACKUPS" | wc -l)
-                        BACKUP_SIZE=$(echo "$OLD_BACKUPS" | xargs du -sh 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                        if confirm_action "Remove $BACKUP_COUNT old VS Code backups older than 30 days ($BACKUP_SIZE)?"; then
-                            echo "$OLD_BACKUPS" | xargs rm -rf 2>/dev/null || true
-                            log_success "Cleaned old VS Code backups"
-                        fi
-                    fi
-                fi
-
-                # Clean old workspace storage (keep recent)
-                if [ -d "$VSCODE_DIR/data/User/workspaceStorage" ]; then
-                    OLD_WS=$(find "$VSCODE_DIR/data/User/workspaceStorage" -maxdepth 1 -type d -mtime +30 2>/dev/null)
-                    if [ -n "$OLD_WS" ]; then
-                        WS_COUNT=$(echo "$OLD_WS" | wc -l)
-                        WS_SIZE=$(echo "$OLD_WS" | xargs du -sh 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                        log_info "Removing $WS_COUNT old workspace folders >30 days ($WS_SIZE)"
-                        echo "$OLD_WS" | xargs rm -rf 2>/dev/null || true
-                        log_success "Cleaned old workspace storage"
-                    fi
-                fi
-            fi
-        fi
-
-        # Auto-clean bin folder
-        if [ -d "$VSCODE_DIR/bin" ]; then
-            BIN_SIZE=$(get_size "$VSCODE_DIR/bin")
-            if [[ "$BIN_SIZE" != "0" ]]; then
-                log_info "Clearing VS Code bin folder: $BIN_SIZE"
-                rm -rf "$VSCODE_DIR/bin"
-                mkdir -p "$VSCODE_DIR/bin"
-                log_success "Cleared VS Code bin folder"
-            fi
-        fi
-
-        # Remove obsolete markers
-        find "$VSCODE_DIR" -name ".obsolete" -delete 2>/dev/null || true
-    else
-        log_info "VS Code Server directory not found"
-    fi
-}
-
-# Function to clean NPM cache
-clean_npm_cache() {
-    log_info "Checking NPM cache..."
-
-    NPM_CACHE="$HOME/.npm"
-    if [ -d "$NPM_CACHE" ]; then
-        SIZE=$(get_size "$NPM_CACHE")
-        log_info "NPM cache is using: $SIZE"
-
-        if confirm_action "Clear NPM cache?"; then
-            npm cache clean --force 2>/dev/null || true
-            log_success "Cleared NPM cache"
-        fi
-    fi
-
-    # Also check for pnpm cache
-    PNPM_CACHE="$HOME/.pnpm-store"
-    if [ -d "$PNPM_CACHE" ]; then
-        SIZE=$(get_size "$PNPM_CACHE")
-        log_info "pnpm cache is using: $SIZE"
-
-        if confirm_action "Clear pnpm cache?"; then
-            pnpm store prune 2>/dev/null || rm -rf "$PNPM_CACHE"
-            log_success "Cleared pnpm cache"
-        fi
-    fi
-}
-
-# Function to clean package manager caches
-clean_package_caches() {
-    log_info "Checking package manager caches..."
-
-    # APT cache (for Debian/Ubuntu)
-    if command -v apt-get &> /dev/null; then
-        APT_CACHE_SIZE=$(du -sh /var/cache/apt 2>/dev/null | cut -f1 || echo "0")
-        log_info "APT cache is using: $APT_CACHE_SIZE"
-
-        if confirm_action "Clean APT cache?"; then
-            apt-get clean 2>/dev/null || true
-            apt-get autoclean 2>/dev/null || true
-            log_success "Cleaned APT cache"
-        fi
-    fi
-
-    # pip cache
-    if command -v pip &> /dev/null; then
-        PIP_CACHE="$HOME/.cache/pip"
-        if [ -d "$PIP_CACHE" ]; then
-            SIZE=$(get_size "$PIP_CACHE")
-            log_info "pip cache is using: $SIZE"
-
-            if confirm_action "Clear pip cache?"; then
-                pip cache purge 2>/dev/null || rm -rf "$PIP_CACHE"/*
-                log_success "Cleared pip cache"
-            fi
-        fi
-    fi
-}
-
-# Function to clean temporary files
-clean_temp_files() {
-    log_info "Checking temporary files..."
-
-    # Skip /tmp cleanup - clears on reboot anyway
-    TMP_SIZE=$(get_size "/tmp")
-    log_info "/tmp is using: $TMP_SIZE (will clear on reboot - skipping cleanup)"
-
-    # User cache
-    USER_CACHE="$HOME/.cache"
-    if [ -d "$USER_CACHE" ]; then
-        SIZE=$(get_size "$USER_CACHE")
-        log_info "User cache is using: $SIZE"
-
-        # Clean specific cache subdirectories
-        for CACHE_DIR in "$USER_CACHE"/*; do
-            if [ -d "$CACHE_DIR" ]; then
-                DIRNAME=$(basename "$CACHE_DIR")
-                case "$DIRNAME" in
-                    thumbnails|trash|*-old|*-backup)
-                        SIZE=$(get_size "$CACHE_DIR")
-                        if [ "$SIZE" != "0" ]; then
-                            log_info "Found $DIRNAME cache: $SIZE"
-                            if confirm_action "Remove $DIRNAME cache?"; then
-                                rm -rf "$CACHE_DIR"
-                                log_success "Removed $DIRNAME cache"
-                            fi
-                        fi
-                        ;;
-                esac
-            fi
-        done
-    fi
-}
-
-# Function to clean Docker if present
-clean_docker() {
-    if command -v docker &> /dev/null; then
-        log_info "Checking Docker resources..."
-
-        # Check for unused containers, images, and volumes
-        if confirm_action "Clean Docker unused resources (containers, images, volumes)?"; then
-            docker system prune -a --volumes -f 2>/dev/null || true
-            log_success "Cleaned Docker resources"
-        fi
-    fi
-}
-
-# Function to clean old log files
-clean_logs() {
-    log_info "Checking log files..."
-
-    # System logs
-    if [ -d "/var/log" ]; then
-        LOG_SIZE=$(get_size "/var/log")
-        log_info "System logs are using: $LOG_SIZE"
-
-        if confirm_action "Clean old log files (*.gz, *.old, *.1-9)?"; then
-            find /var/log -name "*.gz" -delete 2>/dev/null || true
-            find /var/log -name "*.old" -delete 2>/dev/null || true
-            find /var/log -regex ".*\.[1-9]$" -delete 2>/dev/null || true
-            log_success "Cleaned old log files"
-        fi
-    fi
-
-    # User logs
-    USER_LOGS="$HOME/.local/share"
-    if [ -d "$USER_LOGS" ]; then
-        find "$USER_LOGS" -name "*.log" -size +100M 2>/dev/null | while read -r logfile; do
-            SIZE=$(get_size "$logfile")
-            log_info "Large log file: $logfile ($SIZE)"
-            if confirm_action "Truncate this log file?"; then
-                > "$logfile"
-                log_success "Truncated log file"
-            fi
-        done
-    fi
-}
-
-# Function to clean development tool artifacts
-clean_dev_tools() {
-    log_info "Checking development tool artifacts..."
-
-    # SAFETY: Create backup list of important paths to never delete
-    PROTECTED_PATHS=(
-        "$HOME/.ssh"
-        "$HOME/.gitconfig"
-        "$HOME/.bashrc"
-        "$HOME/.zshrc"
-        "$HOME/.profile"
-        "$HOME/.config"
-        "$HOME/.local/bin"
-        "$HOME/work"
-        "$HOME/projects"
-        "$HOME/Documents"
-    )
-
-    # Clean code-server backups (SAFE: these are backups, not active files)
-    CODE_SERVER_BACKUP="$HOME/.local/share/code-server.backup"
-    if [ -d "$CODE_SERVER_BACKUP" ]; then
-        SIZE=$(get_size "$CODE_SERVER_BACKUP")
-        log_info "Code-server backup is using: $SIZE"
-        log_warning "This is a BACKUP directory, not the active code-server"
-        if confirm_action "Remove code-server backup (contains old Cody AI versions)?"; then
-            # Double-check it's really a backup directory
-            if [[ "$CODE_SERVER_BACKUP" == *".backup"* ]]; then
-                rm -rf "$CODE_SERVER_BACKUP"
-                log_success "Removed code-server backup"
-            else
-                log_error "Safety check failed - path doesn't contain .backup"
-            fi
-        fi
-    fi
-
-    # Clean old Claude versions (SAFE: keeps current version)
-    CLAUDE_DIR="$HOME/.local/share/claude/versions"
-    if [ -d "$CLAUDE_DIR" ]; then
-        # Keep only the latest version
-        LATEST_VERSION=$(ls -v "$CLAUDE_DIR" 2>/dev/null | tail -1)
-        OLD_VERSIONS=$(ls -v "$CLAUDE_DIR" 2>/dev/null | head -n -1)
-        if [ -n "$OLD_VERSIONS" ] && [ -n "$LATEST_VERSION" ]; then
-            # Verify we have at least one version to keep
-            TOTAL_VERSIONS=$(ls "$CLAUDE_DIR" 2>/dev/null | wc -l)
-            if [ "$TOTAL_VERSIONS" -gt 1 ]; then
-                OLD_SIZE=$(echo "$OLD_VERSIONS" | xargs -I {} du -sh "$CLAUDE_DIR/{}" 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                log_info "Found old Claude versions using approx $OLD_SIZE"
-                log_warning "Will keep version: $LATEST_VERSION"
-                if confirm_action "Remove old Claude versions?"; then
-                    echo "$OLD_VERSIONS" | xargs -I {} rm -rf "$CLAUDE_DIR/{}"
-                    log_success "Removed old Claude versions"
-                fi
-            else
-                log_info "Only one Claude version found - keeping it"
-            fi
-        fi
-    fi
-
-    # Clean duplicate Next.js binaries (keep only the one matching system)
-    log_info "Checking for duplicate Next.js binaries..."
-    NEXT_BINARIES=$(find "$HOME" -path "*/node_modules/@next/swc-*" -name "*.node" -size +100M 2>/dev/null)
-    if [ -n "$NEXT_BINARIES" ]; then
-        # Detect which variant we need
-        if ldd /bin/ls 2>/dev/null | grep -q musl; then
-            KEEP_VARIANT="musl"
-            REMOVE_VARIANT="gnu"
-        else
-            KEEP_VARIANT="gnu"
-            REMOVE_VARIANT="musl"
-        fi
-
-        REMOVABLE=$(echo "$NEXT_BINARIES" | grep "$REMOVE_VARIANT")
-        if [ -n "$REMOVABLE" ]; then
-            REMOVE_SIZE=$(echo "$REMOVABLE" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
-            log_info "Found unnecessary Next.js $REMOVE_VARIANT binaries using: $REMOVE_SIZE"
-            if confirm_action "Remove unnecessary Next.js $REMOVE_VARIANT binaries (keeping $KEEP_VARIANT)?"; then
-                echo "$REMOVABLE" | xargs rm -f
-                log_success "Removed unnecessary Next.js binaries"
-            fi
-        fi
-    fi
-
-    # Clean duplicate workerd binaries
-    log_info "Checking for duplicate Cloudflare workerd binaries..."
-    WORKERD_BINARIES=$(find "$HOME" -name "workerd" -path "*/bin/workerd" -size +100M 2>/dev/null)
-    WORKERD_COUNT=$(echo "$WORKERD_BINARIES" | wc -l)
-    if [ "$WORKERD_COUNT" -gt 1 ]; then
-        WORKERD_SIZE=$(echo "$WORKERD_BINARIES" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
-        log_info "Found $WORKERD_COUNT workerd binaries using total: $WORKERD_SIZE"
-        echo -e "${YELLOW}Locations:${NC}"
-        echo "$WORKERD_BINARIES" | head -5
-        log_warning "Consider using a single shared workerd binary via symlinks"
-        # Not auto-removing as this needs careful consideration
-    fi
-
-    # Clean old Volta tool versions (SAFE: checks for active version)
-    VOLTA_DIR="$HOME/.volta/tools/image"
-    if [ -d "$VOLTA_DIR" ]; then
-        # Check for old Node versions
-        if [ -d "$VOLTA_DIR/node" ]; then
-            NODE_VERSIONS=$(ls -v "$VOLTA_DIR/node" 2>/dev/null)
-            VERSION_COUNT=$(echo "$NODE_VERSIONS" | wc -l)
-            if [ "$VERSION_COUNT" -gt 1 ]; then
-                # Get the active version from Volta
-                CURRENT_VERSION=$(volta list node 2>/dev/null | grep current | awk '{print $2}' | sed 's/v//')
-
-                # If volta command fails, check for .volta/bin/node symlink
-                if [ -z "$CURRENT_VERSION" ] && [ -L "$HOME/.volta/bin/node" ]; then
-                    CURRENT_VERSION=$(readlink "$HOME/.volta/bin/node" | grep -oP 'node/\K[^/]+')
-                fi
-
-                # Fallback: keep the newest version
-                if [ -z "$CURRENT_VERSION" ]; then
-                    CURRENT_VERSION=$(ls -v "$VOLTA_DIR/node" | tail -1)
-                    log_warning "Could not determine active Node version, will keep newest: $CURRENT_VERSION"
-                fi
-
-                OLD_VERSIONS=$(ls -v "$VOLTA_DIR/node" | grep -v "$CURRENT_VERSION")
-                if [ -n "$OLD_VERSIONS" ]; then
-                    OLD_SIZE=$(echo "$OLD_VERSIONS" | xargs -I {} du -sh "$VOLTA_DIR/node/{}" 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                    log_info "Found old Node versions in Volta using approx $OLD_SIZE"
-                    log_warning "Active version: $CURRENT_VERSION (will be kept)"
-
-                    # Show what will be removed
-                    echo -e "${YELLOW}Versions to remove:${NC}"
-                    echo "$OLD_VERSIONS"
-
-                    if confirm_action "Remove old Node versions from Volta?"; then
-                        # Verify current version exists before removing others
-                        if [ -d "$VOLTA_DIR/node/$CURRENT_VERSION" ]; then
-                            echo "$OLD_VERSIONS" | xargs -I {} rm -rf "$VOLTA_DIR/node/{}"
-                            log_success "Removed old Node versions"
-                        else
-                            log_error "Safety check failed - current version directory not found"
-                        fi
-                    fi
-                fi
-            else
-                log_info "Only one Node version found in Volta - keeping it"
-            fi
-        fi
-
-        # Check for old package manager versions
-        for PM in npm yarn pnpm; do
-            if [ -d "$VOLTA_DIR/$PM" ]; then
-                PM_VERSIONS=$(ls -v "$VOLTA_DIR/$PM" 2>/dev/null | head -n -1)
-                if [ -n "$PM_VERSIONS" ]; then
-                    PM_SIZE=$(echo "$PM_VERSIONS" | xargs -I {} du -sh "$VOLTA_DIR/$PM/{}" 2>/dev/null | awk '{sum+=$1} END {print sum"M"}')
-                    log_info "Found old $PM versions using approx $PM_SIZE"
-                    if confirm_action "Remove old $PM versions from Volta?"; then
-                        echo "$PM_VERSIONS" | xargs -I {} rm -rf "$VOLTA_DIR/$PM/{}"
-                        log_success "Removed old $PM versions"
-                    fi
-                fi
-            fi
-        done
-    fi
-}
-
-# Function to clean Wrangler logs
-clean_wrangler_logs() {
-    log_info "Checking Cloudflare Wrangler logs..."
-
-    WRANGLER_LOGS="$HOME/.config/.wrangler/logs"
-    if [ -d "$WRANGLER_LOGS" ]; then
-        TOTAL_SIZE=$(get_size "$WRANGLER_LOGS")
-        LOG_COUNT=$(find "$WRANGLER_LOGS" -name "*.log" -type f 2>/dev/null | wc -l)
-        
-        if [ "$LOG_COUNT" -gt 0 ]; then
-            log_info "Found $LOG_COUNT Wrangler log files using: $TOTAL_SIZE"
-            
-            # Show largest log files
-            echo -e "${YELLOW}Largest Wrangler logs:${NC}"
-            find "$WRANGLER_LOGS" -name "*.log" -type f -exec du -h {} + 2>/dev/null | sort -rh | head -5
-            echo
-            
-            # Offer to keep only recent logs (last 7 days)
-            OLD_LOGS=$(find "$WRANGLER_LOGS" -name "*.log" -type f -mtime +7 2>/dev/null)
-            if [ -n "$OLD_LOGS" ]; then
-                OLD_COUNT=$(echo "$OLD_LOGS" | wc -l)
-                OLD_SIZE=$(echo "$OLD_LOGS" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
-                log_info "Found $OLD_COUNT log files older than 7 days using: $OLD_SIZE"
-                
-                if confirm_action "Remove Wrangler logs older than 7 days?"; then
-                    echo "$OLD_LOGS" | xargs rm -f 2>/dev/null || true
-                    log_success "Removed old Wrangler logs"
-                fi
-            fi
-            
-            # Offer to remove all logs
-            REMAINING_LOGS=$(find "$WRANGLER_LOGS" -name "*.log" -type f 2>/dev/null | wc -l)
-            if [ "$REMAINING_LOGS" -gt 0 ]; then
-                REMAINING_SIZE=$(get_size "$WRANGLER_LOGS")
-                log_info "Remaining logs: $REMAINING_LOGS files using $REMAINING_SIZE"
-                
-                if confirm_action "Remove ALL Wrangler logs?"; then
-                    find "$WRANGLER_LOGS" -name "*.log" -type f -delete 2>/dev/null || true
-                    log_success "Removed all Wrangler logs"
-                fi
-            fi
-        else
-            log_info "No Wrangler logs found"
-        fi
-    else
-        log_info "Wrangler logs directory not found"
-    fi
-}
-
-# Function to clean cached installers and heavy cache directories
-clean_cached_installers() {
-    log_info "Checking cached installer files and heavy caches..."
-
-    USER_CACHE="$HOME/.cache"
-    if [ -d "$USER_CACHE" ]; then
-        # Safe cache cleanup with confirmations for large removals
-        PLAYWRIGHT_CACHE="$USER_CACHE/ms-playwright"
-        if [ -d "$PLAYWRIGHT_CACHE" ]; then
-            PLAYWRIGHT_SIZE=$(get_size "$PLAYWRIGHT_CACHE")
-            if [[ "$PLAYWRIGHT_SIZE" != "0" ]]; then
-                log_info "Found Playwright browsers cache: $PLAYWRIGHT_SIZE"
-                if confirm_action "Remove Playwright cache (safe - browsers will re-download as needed)?"; then
-                    rm -rf "$PLAYWRIGHT_CACHE"/* 2>/dev/null || true
-                    log_success "Cleared Playwright cache"
-                fi
-            fi
-        fi
-
-        # Code-server cache (usually safe but ask for confirmation)
-        CODE_SERVER_CACHE="$USER_CACHE/code-server"
-        if [ -d "$CODE_SERVER_CACHE" ]; then
-            CODESERVER_SIZE=$(get_size "$CODE_SERVER_CACHE")
-            if [[ "$CODESERVER_SIZE" != "0" ]]; then
-                log_info "Found code-server cache: $CODESERVER_SIZE"
-                if confirm_action "Remove code-server cache?"; then
-                    rm -rf "$CODE_SERVER_CACHE"/* 2>/dev/null || true
-                    log_success "Cleared code-server cache"
-                fi
-            fi
-        fi
-
-        # Claude cache (safe to rebuild - auto-remove)
-        CLAUDE_CACHE="$USER_CACHE/claude"
-        if [ -d "$CLAUDE_CACHE" ]; then
-            CLAUDE_SIZE=$(get_size "$CLAUDE_CACHE")
-            if [[ "$CLAUDE_SIZE" != "0" ]]; then
-                log_info "Removing Claude cache: $CLAUDE_SIZE (safe - rebuilds automatically)"
-                rm -rf "$CLAUDE_CACHE"/* 2>/dev/null || true
-                log_success "Cleared Claude cache"
-            fi
-        fi
-        
-        # Find and auto-remove cached installer files
-        INSTALLER_PATTERNS=(-name "*.deb" -o -name "*.rpm" -o -name "*.AppImage")
-        INSTALLERS=$(find "$USER_CACHE" -type f \( "${INSTALLER_PATTERNS[@]}" \) -size +10M 2>/dev/null)
-        
-        if [ -n "$INSTALLERS" ]; then
-            INSTALLER_COUNT=$(echo "$INSTALLERS" | wc -l)
-            INSTALLER_SIZE=$(echo "$INSTALLERS" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
-            log_info "Removing $INSTALLER_COUNT cached installer files ($INSTALLER_SIZE)"
-            echo "$INSTALLERS" | xargs rm -f 2>/dev/null || true
-            log_success "Removed cached installer files"
-        fi
-        
-        # Auto-remove large archives from cache
-        CACHE_ARCHIVES=$(find "$USER_CACHE" -type f \( -name "*.tar.gz" -o -name "*.tgz" -o -name "*.zip" \) -size +50M 2>/dev/null)
-        
-        if [ -n "$CACHE_ARCHIVES" ]; then
-            ARCHIVE_COUNT=$(echo "$CACHE_ARCHIVES" | wc -l)
-            ARCHIVE_SIZE=$(echo "$CACHE_ARCHIVES" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
-            log_info "Removing $ARCHIVE_COUNT large archive files ($ARCHIVE_SIZE)"
-            echo "$CACHE_ARCHIVES" | xargs rm -f 2>/dev/null || true
-            log_success "Removed large cache archives"
-        fi
-        
-        # Auto-clean specific known problematic cache directories
-        for CACHE_SUBDIR in code vscode chromium; do
-            CACHE_PATH="$USER_CACHE/$CACHE_SUBDIR"
-            if [ -d "$CACHE_PATH" ]; then
-                OLD_PACKAGES=$(find "$CACHE_PATH" -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.tar.gz" \) 2>/dev/null)
-                
-                if [ -n "$OLD_PACKAGES" ]; then
-                    PACKAGE_COUNT=$(echo "$OLD_PACKAGES" | wc -l)
-                    PACKAGE_SIZE=$(echo "$OLD_PACKAGES" | xargs du -ch 2>/dev/null | tail -1 | cut -f1)
-                    log_info "Removing $PACKAGE_COUNT old packages from $CACHE_SUBDIR cache ($PACKAGE_SIZE)"
-                    echo "$OLD_PACKAGES" | xargs rm -f 2>/dev/null || true
-                    log_success "Removed old $CACHE_SUBDIR packages"
-                fi
-            fi
-        done
-    fi
-}
-
-# Function to clean orphaned node_modules
-clean_orphaned_node_modules() {
-    log_info "Checking for orphaned node_modules directories..."
-
-    # Find all node_modules directories in home
-    NODE_MODULES=$(find "$HOME" -type d -name "node_modules" 2>/dev/null)
-    
-    if [ -n "$NODE_MODULES" ]; then
-        ORPHANED=""
-        
-        echo "$NODE_MODULES" | while read -r nm_dir; do
-            # Get parent directory
-            PARENT_DIR=$(dirname "$nm_dir")
-            
-            # Check if there's a package.json in the parent directory
-            if [ ! -f "$PARENT_DIR/package.json" ]; then
-                # Also check one level up (for monorepo workspace packages)
-                GRANDPARENT_DIR=$(dirname "$PARENT_DIR")
-                if [ ! -f "$GRANDPARENT_DIR/package.json" ]; then
-                    # This is likely orphaned
-                    SIZE=$(get_size "$nm_dir")
-                    echo "$nm_dir|$SIZE"
-                fi
-            fi
-        done > /tmp/orphaned_nm.txt
-        
-        if [ -s /tmp/orphaned_nm.txt ]; then
-            ORPHAN_COUNT=$(wc -l < /tmp/orphaned_nm.txt)
-            
-            log_info "Found $ORPHAN_COUNT potentially orphaned node_modules directories"
-            echo -e "${YELLOW}Orphaned node_modules:${NC}"
-            
-            while IFS='|' read -r dir size; do
-                echo "  $size - $dir"
-            done < /tmp/orphaned_nm.txt
-            echo
-            
-            log_warning "These directories don't have a package.json in their parent directory"
-            log_warning "Review carefully before deleting - some may be intentional (e.g., global installs)"
-            
-            if confirm_action "Show detailed information about these directories?"; then
-                while IFS='|' read -r dir size; do
-                    echo -e "\n${BLUE}Directory:${NC} $dir"
-                    echo -e "${BLUE}Size:${NC} $size"
-                    echo -e "${BLUE}Last modified:${NC} $(stat -c %y "$dir" 2>/dev/null | cut -d' ' -f1)"
-                    echo -e "${BLUE}File count:${NC} $(find "$dir" -type f 2>/dev/null | wc -l)"
-                    
-                    # Try to identify what project this might have been from
-                    if [ -f "$dir/../package-lock.json" ]; then
-                        echo -e "${BLUE}Note:${NC} package-lock.json exists (package.json might have been deleted)"
-                    fi
-                done < /tmp/orphaned_nm.txt
-                echo
-            fi
-            
-            if confirm_action "Remove orphaned node_modules directories?"; then
-                while IFS='|' read -r dir size; do
-                    log_info "Removing: $dir ($size)"
-                    rm -rf "$dir" 2>/dev/null || log_error "Failed to remove $dir"
-                done < /tmp/orphaned_nm.txt
-                log_success "Removed orphaned node_modules"
-            fi
-        else
-            log_info "No orphaned node_modules directories found"
-        fi
-        
-        rm -f /tmp/orphaned_nm.txt
-    else
-        log_info "No node_modules directories found in $HOME"
-    fi
-    
-    # Also check for node_modules in the home root (common mistake)
-    if [ -d "$HOME/node_modules" ]; then
-        if [ ! -f "$HOME/package.json" ]; then
-            SIZE=$(get_size "$HOME/node_modules")
-            log_warning "Found node_modules in $HOME root without package.json ($SIZE)"
-            log_warning "This is likely from running 'npm install' in the wrong directory"
-            
-            if confirm_action "Remove $HOME/node_modules?"; then
-                rm -rf "$HOME/node_modules"
-                log_success "Removed $HOME/node_modules"
-            fi
-        fi
-    fi
-}
-
-# Function to clean system logs and journals
-clean_system_logs() {
-    log_info "Checking system logs and journals..."
-
-    # Clean systemd journal logs (auto-clean to 100MB)
-    if command -v journalctl &> /dev/null; then
-        log_info "Cleaning systemd journals to 100MB..."
-        journalctl --vacuum-size=100M 2>/dev/null || true
-        journalctl --vacuum-time=7d 2>/dev/null || true
-        log_success "Cleaned systemd journals"
-    fi
-
-    # Clean APT logs and cache automatically
-    if command -v apt-get &> /dev/null; then
-        log_info "Cleaning APT cache and logs..."
-        apt-get clean 2>/dev/null || true
-        apt-get autoremove -y 2>/dev/null || true
-        
-        # Clean old apt logs
-        if [ -d "/var/log/apt" ]; then
-            find /var/log/apt -name "*.log.*" -delete 2>/dev/null || true
-        fi
-        log_success "Cleaned APT cache and logs"
-    fi
-
-    # Clean other system logs
-    if [ -d "/var/log" ]; then
-        # Clean rotated logs
-        find /var/log -name "*.gz" -delete 2>/dev/null || true
-        find /var/log -name "*.old" -delete 2>/dev/null || true
-        find /var/log -regex ".*\.[1-9]$" -delete 2>/dev/null || true
-        
-        # Only truncate extremely large logs (>500MB) and ask first
-        LARGE_LOGS=$(find /var/log -name "*.log" -size +500M 2>/dev/null)
-        if [ -n "$LARGE_LOGS" ]; then
-            LOG_COUNT=$(echo "$LARGE_LOGS" | wc -l)
-            if confirm_action "Found $LOG_COUNT very large log files (>500MB). Truncate to 50MB?"; then
-                echo "$LARGE_LOGS" | xargs -I {} truncate -s 50M {} 2>/dev/null || true
-                log_success "Truncated very large log files"
-            fi
-        fi
-        log_success "Cleaned system logs"
-    fi
-}
-
-# Function to clean Wrangler temp files
-clean_wrangler_temp() {
-    log_info "Checking Wrangler temp files..."
-    
-    WRANGLER_TEMP="$HOME/.config/.wrangler/tmp"
-    if [ -d "$WRANGLER_TEMP" ]; then
-        TEMP_SIZE=$(get_size "$WRANGLER_TEMP")
-        if [[ "$TEMP_SIZE" != "0" ]]; then
-            log_info "Removing Wrangler temp files: $TEMP_SIZE"
-            rm -rf "$WRANGLER_TEMP"/* 2>/dev/null || true
-            log_success "Cleared Wrangler temp files"
-        fi
-    fi
-}
-
-# Function to find large files
-find_large_files() {
-    log_info "Looking for large files in $HOME..."
-
-    echo -e "\n${YELLOW}Top 10 largest files:${NC}"
-    find "$HOME" -type f -size +100M -exec du -h {} + 2>/dev/null | sort -rh | head -10
-
-    echo -e "\n${YELLOW}Large directories:${NC}"
-    du -h --max-depth=2 "$HOME" 2>/dev/null | sort -rh | head -15
-
-    echo -e "\n${YELLOW}Quick cleanup command (if you want to run manually):${NC}"
-    echo "rm -rf ~/.cache/ms-playwright/* ~/.cache/code-server/* ~/.cache/claude/* && npm cache clean --force && sudo apt-get clean && sudo journalctl --vacuum-size=100M"
-}
-
-# Main execution
 main() {
-    echo -e "${GREEN}=== System Cleanup Script ===${NC}"
-    echo -e "${YELLOW}This script will help free up disk space${NC}\n"
+    parse_args "$@"
 
-    # Show current disk usage
+    echo -e "${GREEN}=== System Cleanup ===${NC}"
+    [[ "$DRY_RUN" == "true" ]] && echo -e "${YELLOW}DRY-RUN MODE — no changes will be made${NC}"
+    [[ "$AUTO_MODE" == "true" ]] && echo -e "${YELLOW}AUTO MODE — safe targets cleaned without prompts${NC}"
+    echo
+
+    # Load configuration
+    if [[ -n "$CONFIG_FILE" ]]; then
+        load_cleanup_config "$CONFIG_FILE"
+    elif [[ -n "${CLEANUP_CONFIG:-}" && -f "$CLEANUP_CONFIG" ]]; then
+        load_cleanup_config "$CLEANUP_CONFIG"
+    elif [[ -f "$HOME/.config/tools/cleanup.yaml" ]]; then
+        load_cleanup_config "$HOME/.config/tools/cleanup.yaml"
+    else
+        init_cleanup_defaults
+    fi
+
+    # Disk usage before
+    local INITIAL_USAGE
+    INITIAL_USAGE=$(df / | awk 'NR==2 {print $3}')
     log_info "Current disk usage:"
     df -h /
     echo
 
-    # Run cleanup functions (more aggressive order)
-    clean_cached_installers  # Includes Playwright, code-server, Claude caches
-    echo
-    clean_vscode_server      # Now more aggressive auto-cleanup
-    echo
-    clean_system_logs        # New: system logs and journals
-    echo
-    clean_npm_cache
-    echo
-    clean_package_caches
-    echo
-    clean_wrangler_logs
-    echo
-    clean_wrangler_temp      # New: Wrangler temp files
-    echo
-    clean_dev_tools
-    echo
-    clean_orphaned_node_modules
-    echo
-    clean_temp_files
-    echo
-    clean_docker
-    echo
-    clean_logs
-    echo
-
-    # Show large files for manual review
-    if confirm_action "Search for large files?"; then
-        find_large_files
+    # Run cleanup modules based on config
+    if target_enabled "dev_tools"; then
+        clean_cached_installers
+        echo
     fi
 
-    # Calculate space freed
-    FINAL_USAGE=$(df / | awk 'NR==2 {print $3}')
-    FREED_KB=$((INITIAL_USAGE - FINAL_USAGE))
+    if target_enabled "vscode"; then
+        clean_vscode_server
+        echo
+    fi
 
-    if [ $FREED_KB -gt 0 ]; then
-        FREED_MB=$((FREED_KB / 1024))
-        echo -e "\n${GREEN}=== Cleanup Complete ===${NC}"
+    if target_enabled "system"; then
+        clean_system_logs
+        echo
+    fi
+
+    if target_enabled "nodejs"; then
+        clean_npm_cache
+        echo
+        clean_package_caches
+        echo
+        clean_orphaned_node_modules
+        echo
+    fi
+
+    if target_enabled "wrangler"; then
+        clean_wrangler
+        echo
+    fi
+
+    if target_enabled "dev_tools"; then
+        clean_dev_tools
+        echo
+    fi
+
+    if target_enabled "docker"; then
+        clean_docker
+        echo
+    fi
+
+    if target_enabled "system"; then
+        clean_temp_files
+        echo
+        clean_user_logs
+        echo
+    fi
+
+    # System updates (opt-in)
+    if [[ "$RUN_UPDATES" == "true" ]]; then
+        echo -e "${GREEN}=== System Updates ===${NC}"
+        echo
+        run_system_updates
+        echo
+    fi
+
+    # Large file scan
+    if [[ "$DRY_RUN" != "true" ]]; then
+        if confirm_action "Search for large files?"; then
+            log_info "Looking for large files in \$HOME..."
+            echo -e "\n${YELLOW}Top 10 largest files:${NC}"
+            find "$HOME" -type f -size +100M -exec du -h {} + 2>/dev/null | sort -rh | head -10
+            echo -e "\n${YELLOW}Large directories:${NC}"
+            du -h --max-depth=2 "$HOME" 2>/dev/null | sort -rh | head -15
+        fi
+    fi
+
+    # Summary
+    local FINAL_USAGE
+    FINAL_USAGE=$(df / | awk 'NR==2 {print $3}')
+    local FREED_KB=$((INITIAL_USAGE - FINAL_USAGE))
+
+    echo
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo -e "${GREEN}=== Dry-Run Complete ===${NC}"
+        log_info "No changes were made."
+    elif [[ $FREED_KB -gt 0 ]]; then
+        local FREED_MB=$((FREED_KB / 1024))
+        echo -e "${GREEN}=== Cleanup Complete ===${NC}"
         log_success "Freed approximately ${FREED_MB}MB of disk space"
     else
-        echo -e "\n${GREEN}=== Cleanup Complete ===${NC}"
+        echo -e "${GREEN}=== Cleanup Complete ===${NC}"
         log_info "No significant space was freed"
     fi
 
@@ -855,8 +185,8 @@ main() {
     df -h /
 }
 
-# Run with error handling
-if [ "$EUID" -eq 0 ] && [ "$HOME" != "/root" ]; then
+# Safety check
+if [[ "$EUID" -eq 0 && "$HOME" != "/root" ]]; then
     log_warning "Running as root but HOME is not /root. Be careful!"
 fi
 

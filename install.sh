@@ -1,393 +1,201 @@
 #!/usr/bin/env bash
-# Installation script for Tools Repository
+# Tools Repository — installer / uninstaller
+# Adds bin/ to PATH so `session` and `cleanup` work globally.
+# Project wrappers go in ~/.local/bin via `session install`.
 
 set -euo pipefail
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Configuration
 TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="$HOME/.local/bin"
+TOOLS_BIN="$TOOLS_DIR/bin"
+WRAPPER_DIR="$HOME/.local/bin"
 CONFIG_DIR="$HOME/.config/tools"
+CACHE_DIR="$HOME/.cache/tools"
 
-# Logging functions
-log_info() { echo -e "${BLUE}INFO:${NC} $*"; }
-log_success() { echo -e "${GREEN}SUCCESS:${NC} $*"; }
-log_warning() { echo -e "${YELLOW}WARNING:${NC} $*"; }
-log_error() { echo -e "${RED}ERROR:${NC} $*"; }
+# Marker used in shell configs so we can find and remove our lines
+PATH_MARKER="# tools-repo"
 
-# Check dependencies
-check_dependencies() {
-    log_info "Checking dependencies..."
-    
+info()    { echo -e "${BLUE}::${NC} $*"; }
+ok()      { echo -e "${GREEN}::${NC} $*"; }
+warn()    { echo -e "${YELLOW}::${NC} $*"; }
+err()     { echo -e "${RED}::${NC} $*" >&2; }
+
+# ─── Dependency check ───────────────────────────────────────────────
+check_deps() {
     local missing=()
-    
-    # Required dependencies
-    if ! command -v tmux >/dev/null 2>&1; then
-        missing+=("tmux")
-    fi
-    
-    if ! command -v bash >/dev/null 2>&1; then
-        missing+=("bash")
-    fi
-    
-    # Check bash version (need 4.0+)
+    command -v tmux  >/dev/null 2>&1 || missing+=("tmux")
+    command -v bash  >/dev/null 2>&1 || missing+=("bash")
     if [[ ${BASH_VERSION%%.*} -lt 4 ]]; then
-        log_error "Bash 4.0+ required (found: $BASH_VERSION)"
-        exit 1
+        err "Bash 4.0+ required (found: $BASH_VERSION)"; exit 1
     fi
-    
     if [[ ${#missing[@]} -gt 0 ]]; then
-        log_error "Missing dependencies: ${missing[*]}"
-        echo "Please install them and try again:"
-        echo "  Ubuntu/Debian: sudo apt install ${missing[*]}"
-        echo "  RHEL/CentOS:   sudo yum install ${missing[*]}"
-        echo "  macOS:         brew install ${missing[*]}"
+        err "Missing: ${missing[*]}"
+        echo "  apt install ${missing[*]}"
         exit 1
     fi
-    
-    log_success "All dependencies satisfied"
+    ok "Dependencies satisfied"
 }
 
-# Create directories
-create_directories() {
-    log_info "Creating directories..."
-    
-    mkdir -p "$INSTALL_DIR"
-    mkdir -p "$CONFIG_DIR"/{sessions,cleanup}
-    mkdir -p "$CONFIG_DIR/examples"
-    
-    log_success "Created directories"
-}
+# ─── Add tools/bin to PATH in shell rc files ────────────────────────
+add_to_path() {
+    # Also ensure ~/.local/bin is in PATH (for project wrappers)
+    local dirs_to_add=("$TOOLS_BIN" "$WRAPPER_DIR")
 
-# Install binaries
-install_binaries() {
-    log_info "Installing binaries..."
-    
-    # Install session manager
-    cat > "$INSTALL_DIR/session" << 'EOF'
-#!/usr/bin/env bash
-# Session Manager wrapper - automatically finds tools directory
-set -euo pipefail
-
-# Find tools directory
-TOOLS_DIR=""
-if [[ -n "${TOOLS_HOME:-}" && -f "$TOOLS_HOME/bin/session-new" ]]; then
-    TOOLS_DIR="$TOOLS_HOME"
-elif [[ -f "$HOME/.local/share/tools/bin/session-new" ]]; then
-    TOOLS_DIR="$HOME/.local/share/tools"
-elif [[ -f "/usr/local/share/tools/bin/session-new" ]]; then
-    TOOLS_DIR="/usr/local/share/tools"
-else
-    echo "Error: Tools installation not found" >&2
-    echo "Set TOOLS_HOME environment variable or reinstall tools" >&2
-    exit 1
-fi
-
-exec "$TOOLS_DIR/bin/session-new" "$@"
-EOF
-    
-    chmod +x "$INSTALL_DIR/session"
-    
-    # Install cleanup utility
-    cat > "$INSTALL_DIR/cleanup" << EOF
-#!/usr/bin/env bash
-# Cleanup utility wrapper
-set -euo pipefail
-
-# Find tools directory
-TOOLS_DIR=""
-if [[ -n "\${TOOLS_HOME:-}" && -f "\$TOOLS_HOME/bin/cleanup" ]]; then
-    TOOLS_DIR="\$TOOLS_HOME"
-elif [[ -f "\$HOME/.local/share/tools/bin/cleanup" ]]; then
-    TOOLS_DIR="\$HOME/.local/share/tools"
-elif [[ -f "/usr/local/share/tools/bin/cleanup" ]]; then
-    TOOLS_DIR="/usr/local/share/tools"
-else
-    echo "Error: Tools installation not found" >&2
-    exit 1
-fi
-
-exec "\$TOOLS_DIR/bin/cleanup" "\$@"
-EOF
-    
-    chmod +x "$INSTALL_DIR/cleanup"
-    
-    log_success "Installed binaries to $INSTALL_DIR"
-}
-
-# Install tools directory
-install_tools() {
-    log_info "Installing tools to ~/.local/share/tools..."
-    
-    local target_dir="$HOME/.local/share/tools"
-    
-    # Remove existing installation
-    if [[ -d "$target_dir" ]]; then
-        rm -rf "$target_dir"
-    fi
-    
-    # Copy tools directory
-    cp -r "$TOOLS_DIR" "$target_dir"
-    
-    # Make sure binaries are executable
-    chmod +x "$target_dir/bin"/*
-    chmod +x "$target_dir/scripts"/*
-    
-    log_success "Installed tools to $target_dir"
-}
-
-# Copy example configurations
-install_examples() {
-    log_info "Installing example configurations..."
-    
-    cp -r "$TOOLS_DIR/config/examples"/* "$CONFIG_DIR/examples/"
-    
-    log_success "Installed examples to $CONFIG_DIR/examples"
-}
-
-# Update PATH
-update_path() {
-    log_info "Updating PATH..."
-    
-    local updated=false
-    
-    # Check if already in PATH
-    if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-        # Update .bashrc
-        if [[ -f "$HOME/.bashrc" ]]; then
-            if ! grep -q "export PATH.*$INSTALL_DIR" "$HOME/.bashrc"; then
-                echo "" >> "$HOME/.bashrc"
-                echo "# Added by tools installer" >> "$HOME/.bashrc"
-                echo "export PATH=\"\$PATH:$INSTALL_DIR\"" >> "$HOME/.bashrc"
-                updated=true
-                log_info "Updated ~/.bashrc"
+    for dir in "${dirs_to_add[@]}"; do
+        for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+            [[ -f "$rc" ]] || continue
+            if ! grep -qF "$dir" "$rc" 2>/dev/null; then
+                echo "" >> "$rc"
+                echo "export PATH=\"$dir:\$PATH\"  $PATH_MARKER" >> "$rc"
+                info "Added $dir to $rc"
             fi
-        fi
-        
-        # Update .zshrc if it exists
-        if [[ -f "$HOME/.zshrc" ]]; then
-            if ! grep -q "export PATH.*$INSTALL_DIR" "$HOME/.zshrc"; then
-                echo "" >> "$HOME/.zshrc"
-                echo "# Added by tools installer" >> "$HOME/.zshrc"
-                echo "export PATH=\"\$PATH:$INSTALL_DIR\"" >> "$HOME/.zshrc"
-                updated=true
-                log_info "Updated ~/.zshrc"
-            fi
-        fi
-        
-        # Update current session
-        export PATH="$PATH:$INSTALL_DIR"
-        
-        if [[ "$updated" == true ]]; then
-            log_success "Updated shell configuration files"
-        else
-            log_info "PATH already configured"
-        fi
-    else
-        log_info "PATH already includes $INSTALL_DIR"
-    fi
-}
-
-# Set TOOLS_HOME environment variable
-set_tools_home() {
-    log_info "Setting TOOLS_HOME environment variable..."
-    
-    local tools_home="$HOME/.local/share/tools"
-    local updated=false
-    
-    # Update .bashrc
-    if [[ -f "$HOME/.bashrc" ]]; then
-        if ! grep -q "TOOLS_HOME" "$HOME/.bashrc"; then
-            echo "export TOOLS_HOME=\"$tools_home\"" >> "$HOME/.bashrc"
-            updated=true
-        fi
-    fi
-    
-    # Update .zshrc if it exists
-    if [[ -f "$HOME/.zshrc" ]]; then
-        if ! grep -q "TOOLS_HOME" "$HOME/.zshrc"; then
-            echo "export TOOLS_HOME=\"$tools_home\"" >> "$HOME/.zshrc"
-            updated=true
-        fi
-    fi
-    
-    # Set for current session
-    export TOOLS_HOME="$tools_home"
-    
-    if [[ "$updated" == true ]]; then
-        log_success "Set TOOLS_HOME=$tools_home"
-    else
-        log_info "TOOLS_HOME already configured"
-    fi
-}
-
-# Migrate existing configurations
-migrate_existing() {
-    log_info "Checking for existing configurations to migrate..."
-    
-    local migrated=0
-    
-    # Look for existing bash configs
-    local search_dirs=("$HOME" "$HOME/workers" "$HOME/projects")
-    
-    for search_dir in "${search_dirs[@]}"; do
-        if [[ ! -d "$search_dir" ]]; then
-            continue
-        fi
-        
-        # Find bash session configs
-        while IFS= read -r -d '' config_file; do
-            local basename=$(basename "$config_file" .sh)
-            basename=${basename%-config}
-            local yaml_file="$CONFIG_DIR/sessions/${basename}.session.yaml"
-            
-            if [[ ! -f "$yaml_file" ]]; then
-                log_info "Found config to migrate: $config_file"
-                if "$HOME/.local/share/tools/scripts/migrate-to-yaml.sh" "$config_file" "$yaml_file" 2>/dev/null; then
-                    log_success "Migrated: $yaml_file"
-                    ((migrated++))
-                else
-                    log_warning "Failed to migrate: $config_file (will need manual conversion)"
-                fi
-            fi
-        done < <(find "$search_dir" -maxdepth 2 -name "*session*config*.sh" -print0 2>/dev/null)
+        done
     done
-    
-    if [[ $migrated -gt 0 ]]; then
-        log_success "Migrated $migrated configuration(s)"
-    else
-        log_info "No existing configurations found to migrate"
-    fi
+
+    # Update current shell
+    export PATH="$TOOLS_BIN:$WRAPPER_DIR:$PATH"
+    ok "PATH configured"
 }
 
-# Verify installation
-verify_installation() {
-    log_info "Verifying installation..."
-    
-    # Test session command
+# ─── Make binaries executable ────────────────────────────────────────
+set_permissions() {
+    chmod +x "$TOOLS_BIN"/* 2>/dev/null || true
+    ok "Permissions set"
+}
+
+# ─── Create config dirs ─────────────────────────────────────────────
+create_dirs() {
+    mkdir -p "$WRAPPER_DIR"
+    mkdir -p "$CONFIG_DIR"
+    ok "Directories ready"
+}
+
+# ─── Verify ──────────────────────────────────────────────────────────
+verify() {
+    local ok=true
     if command -v session >/dev/null 2>&1; then
-        log_success "Session command available"
+        ok "session command available"
     else
-        log_error "Session command not found in PATH"
-        return 1
+        warn "session not in PATH yet (restart terminal or source shell rc)"
+        ok=false
     fi
-    
-    # Test cleanup command
     if command -v cleanup >/dev/null 2>&1; then
-        log_success "Cleanup command available"
+        ok "cleanup command available"
     else
-        log_error "Cleanup command not found in PATH"
-        return 1
+        warn "cleanup not in PATH yet (restart terminal or source shell rc)"
+        ok=false
     fi
-    
-    # Test tools directory
-    if [[ -n "${TOOLS_HOME:-}" && -d "$TOOLS_HOME" ]]; then
-        log_success "TOOLS_HOME configured: $TOOLS_HOME"
-    else
-        log_error "TOOLS_HOME not configured"
-        return 1
-    fi
-    
-    return 0
 }
 
-# Show completion message
-show_completion() {
+# ─── Install ─────────────────────────────────────────────────────────
+do_install() {
+    echo -e "${GREEN}Tools Installer${NC}"
+    echo "==============="
+    echo
+
+    check_deps
+    create_dirs
+    set_permissions
+    add_to_path
+    verify
+
     cat << EOF
 
-${GREEN}🚀 Installation Complete!${NC}
-=====================================
+${GREEN}Installed.${NC}
 
-${BLUE}Installed commands:${NC}
-  • session    - YAML-based tmux session manager
-  • cleanup    - System cleanup utility
+  Commands (available after terminal restart or \`source ~/.bashrc\`):
+    session          YAML-based tmux session manager
+    cleanup          System cleanup utility
+    self-update      Pull latest and refresh
 
-${BLUE}Configuration:${NC}
-  • TOOLS_HOME: $HOME/.local/share/tools
-  • Config dir: $CONFIG_DIR
-  • Examples:   $CONFIG_DIR/examples/
+  Register a project:
+    session install /path/to/myproject.yaml
+    # Creates ~/.local/bin/<name> wrapper (name read from YAML)
 
-${BLUE}Quick Start:${NC}
-  1. Copy an example config:
-     cp $CONFIG_DIR/examples/simple-project.session.yaml myproject.session.yaml
+  Uninstall everything:
+    ./install.sh uninstall
 
-  2. Edit the config for your project
-
-  3. Start your session:
-     session myproject
-
-${BLUE}Commands:${NC}
-  session myproject                 # Start session
-  session myproject --headless      # Start in background
-  session myproject backend         # Start subsession
-  session myproject status          # Show status
-  session myproject kill            # Kill all sessions
-  cleanup                          # Run system cleanup
-  cleanup --dry-run                # Preview cleanup
-
-${YELLOW}Note: Restart your terminal or run 'source ~/.bashrc' to use the new commands.${NC}
-
-${BLUE}Documentation:${NC}
-  • Session docs: $TOOLS_HOME/docs/SESSION.md
-  • Cleanup docs: $TOOLS_HOME/docs/CLEANUP.md
-  • Examples:     $TOOLS_HOME/config/examples/
-
+  Docs: $TOOLS_DIR/docs/
 EOF
 }
 
-# Main installation
-main() {
-    echo -e "${GREEN}Tools Repository Installer${NC}"
-    echo "=========================="
+# ─── Uninstall ────────────────────────────────────────────────────────
+do_uninstall() {
+    echo -e "${RED}Uninstalling tools${NC}"
     echo
-    
-    # Run installation steps
-    check_dependencies
-    create_directories
-    install_tools
-    install_binaries
-    install_examples
-    update_path
-    set_tools_home
-    migrate_existing
-    
-    # Verify installation
-    if verify_installation; then
-        show_completion
-    else
-        log_error "Installation verification failed"
-        exit 1
+
+    # Remove project wrappers created by `session install`
+    local removed_wrappers=0
+    if [[ -d "$WRAPPER_DIR" ]]; then
+        while IFS= read -r wrapper; do
+            local name
+            name=$(basename "$wrapper")
+            info "Removing project wrapper: $name"
+            rm -f "$wrapper"
+            ((removed_wrappers++))
+        done < <(grep -rl "tools-session-wrapper" "$WRAPPER_DIR" 2>/dev/null || true)
     fi
+
+    # Remove old generic wrappers from previous installs
+    for old_wrapper in session-manager session cleanup tools-update; do
+        if [[ -f "$WRAPPER_DIR/$old_wrapper" ]]; then
+            info "Removing old wrapper: $old_wrapper"
+            rm -f "$WRAPPER_DIR/$old_wrapper"
+        fi
+    done
+
+    # Remove PATH and env entries from shell configs
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        [[ -f "$rc" ]] || continue
+        if grep -qF "$PATH_MARKER" "$rc" 2>/dev/null; then
+            # Remove lines containing our marker
+            sed -i "/$PATH_MARKER/d" "$rc"
+            # Remove any old TOOLS_HOME lines
+            sed -i '/^export TOOLS_HOME=/d' "$rc"
+            # Clean up blank lines we left behind (collapse multiple blanks)
+            sed -i '/^$/N;/^\n$/d' "$rc"
+            info "Cleaned $rc"
+        fi
+    done
+
+    # Remove config and cache dirs
+    if [[ -d "$CONFIG_DIR" ]]; then
+        info "Removing $CONFIG_DIR"
+        rm -rf "$CONFIG_DIR"
+    fi
+    if [[ -d "$CACHE_DIR" ]]; then
+        info "Removing $CACHE_DIR"
+        rm -rf "$CACHE_DIR"
+    fi
+
+    # Remove old install location if it exists
+    if [[ -d "$HOME/.local/share/tools" ]]; then
+        info "Removing old install copy at ~/.local/share/tools"
+        rm -rf "$HOME/.local/share/tools"
+    fi
+
+    echo
+    ok "Uninstalled. Removed $removed_wrappers project wrapper(s)."
+    ok "The repo at $TOOLS_DIR is untouched — delete it manually if desired."
 }
 
-# Handle command line arguments
+# ─── Entry point ──────────────────────────────────────────────────────
 case "${1:-install}" in
-    "install"|"")
-        main
-        ;;
-    "uninstall")
-        echo "Uninstalling tools..."
-        rm -f "$INSTALL_DIR/session" "$INSTALL_DIR/cleanup"
-        rm -rf "$HOME/.local/share/tools"
-        echo "Uninstalled. You may need to manually remove PATH entries from shell configs."
-        ;;
-    "help"|"--help"|"-h")
-        echo "Usage: install.sh [install|uninstall|help]"
-        echo ""
-        echo "Commands:"
-        echo "  install      Install tools (default)"
-        echo "  uninstall    Remove installation"
-        echo "  help         Show this help"
+    install|"")   do_install ;;
+    uninstall)    do_uninstall ;;
+    update)       exec "$TOOLS_DIR/bin/self-update" ;;
+    help|--help|-h)
+        echo "Usage: install.sh [install|uninstall|update|help]"
+        echo
+        echo "  install      Add tools/bin to PATH (default)"
+        echo "  uninstall    Remove all tools traces from the system"
+        echo "  update       Git pull + refresh"
         ;;
     *)
-        echo "Unknown command: $1"
-        echo "Use 'install.sh help' for usage information"
-        exit 1
-        ;;
+        err "Unknown: $1"; echo "Run: install.sh help"; exit 1 ;;
 esac
