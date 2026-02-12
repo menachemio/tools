@@ -1,0 +1,66 @@
+# Microservices project session configuration  
+name: microservices
+timezone: America/New_York
+show_utc: true
+color: orange
+
+subsessions:
+  auth-service:
+    dir: ./services/auth
+    command: go run main.go
+    env: |
+      PORT=8001
+      DB_HOST=localhost
+  
+  api-gateway:
+    dir: ./services/gateway
+    command: npm run dev
+    env: |
+      PORT=8000
+    delay: 5
+  
+  user-service:
+    dir: ./services/users
+    command: npm run dev
+    env: |
+      PORT=8002
+    delay: 3
+  
+  database:
+    dir: ./
+    command: docker-compose up -d postgres redis
+
+windows:
+  - name: services
+    color: cyan
+    panes:
+      - type: subsession
+        subsession: auth-service
+      - type: subsession  
+        subsession: api-gateway
+      - type: subsession
+        subsession: user-service
+      - type: subsession
+        subsession: database
+  
+  - name: monitoring
+    color: red
+    panes:
+      - type: command
+        cmd: "watch docker ps"
+        execute: true
+      - type: command
+        cmd: "docker-compose logs -f"
+        execute: false
+        history: true
+  
+  - name: development
+    color: green
+    panes:
+      - type: command
+        cmd: nvim
+        execute: true
+      - type: command
+        cmd: "git status && git log --oneline -10"
+        execute: true
+        history: true
