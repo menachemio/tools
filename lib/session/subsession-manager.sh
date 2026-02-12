@@ -29,11 +29,26 @@ start_subsession() {
         return 1
     fi
 
-    # Set environment variables if provided
+    # Build export prefix from environment variables if provided
+    local export_prefix=""
     if [[ -n "$env_vars" ]]; then
+        local env_pairs=""
         while IFS='=' read -r key value; do
-            [[ -n "$key" ]] && tmux setenv -t "$name" "$key" "$value"
+            # Skip empty lines
+            [[ -z "$key" ]] && continue
+            # Trim whitespace
+            key="${key## }"; key="${key%% }"
+            value="${value## }"; value="${value%% }"
+            [[ -z "$key" ]] && continue
+            if [[ -n "$env_pairs" ]]; then
+                env_pairs="$env_pairs $key=$value"
+            else
+                env_pairs="$key=$value"
+            fi
         done <<< "$env_vars"
+        if [[ -n "$env_pairs" ]]; then
+            export_prefix="export $env_pairs; "
+        fi
     fi
 
     # Apply delay if specified
@@ -41,9 +56,12 @@ start_subsession() {
         sleep "$delay"
     fi
 
-    # Send command if provided
+    # Send command if provided, with env exports prepended
     if [[ -n "$command" && "$command" != "bash" ]]; then
-        tmux send-keys -t "$name" "$command" Enter 2>/dev/null || true
+        tmux send-keys -t "$name" "${export_prefix}${command}" Enter 2>/dev/null || true
+    elif [[ -n "$export_prefix" ]]; then
+        # Even if no command (or command is bash), still export the env vars
+        tmux send-keys -t "$name" "${export_prefix%%; }" Enter 2>/dev/null || true
     fi
 
     ACTIVE_SUBSESSIONS["$name"]="$dir"

@@ -8,22 +8,15 @@ subsessions:
   auth-service:
     dir: ./services/auth
     command: go run main.go
-    env: |
-      PORT=8001
-      DB_HOST=localhost
-  
+
   api-gateway:
     dir: ./services/gateway
     command: npm run dev
-    env: |
-      PORT=8000
     delay: 5
-  
+
   user-service:
     dir: ./services/users
     command: npm run dev
-    env: |
-      PORT=8002
     delay: 3
   
   database:

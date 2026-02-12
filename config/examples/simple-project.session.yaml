@@ -8,10 +8,7 @@ subsessions:
   backend:
     dir: ./api
     command: npm run dev
-    env: |
-      PORT=3000
-      NODE_ENV=development
-  
+
   frontend:
     dir: ./web
     command: npm start
