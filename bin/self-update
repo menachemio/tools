@@ -14,10 +14,69 @@ info() { echo -e "${BLUE}::${NC} $*"; }
 ok()   { echo -e "${GREEN}::${NC} $*"; }
 err()  { echo -e "${RED}ERROR:${NC} $*" >&2; }
 
+VERBOSE=false
+DRY_RUN=false
+
+show_help() {
+    cat <<'EOF'
+Self-update — pull latest changes and refresh installation
+
+Usage:
+  self-update                  Update tools from git remote
+  self-update -d, --dry-run    Preview what would change
+  self-update -v, --verbose    Show detailed output
+  self-update -h, --help       Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h|help)
+            show_help
+            exit 0
+            ;;
+        --verbose|-v)
+            VERBOSE=true
+            shift
+            ;;
+        --dry-run|-d)
+            DRY_RUN=true
+            shift
+            ;;
+        -*)
+            err "Unknown flag: $1. Try: self-update --help"
+            exit 1
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
 if [[ ! -d "$TOOLS_DIR/.git" ]]; then
     err "Not a git repository: $TOOLS_DIR"
     err "Self-update requires a git-based installation."
     exit 1
+fi
+
+# Build quiet flag based on verbose setting
+QUIET_FLAG="--quiet"
+if [[ "$VERBOSE" == true ]]; then
+    QUIET_FLAG=""
+fi
+
+# Dry-run mode: fetch and show what would change, then exit
+if [[ "$DRY_RUN" == true ]]; then
+    info "Dry run: fetching from $(git -C "$TOOLS_DIR" remote get-url origin 2>/dev/null || echo 'local repo')..."
+    git -C "$TOOLS_DIR" fetch --dry-run 2>&1
+    info "Pending commits:"
+    pending="$(git -C "$TOOLS_DIR" log HEAD..origin/main --oneline 2>/dev/null)" || true
+    if [[ -n "$pending" ]]; then
+        echo "$pending"
+    else
+        echo "  (none — already up to date)"
+    fi
+    exit 0
 fi
 
 info "Updating tools from $(git -C "$TOOLS_DIR" remote get-url origin 2>/dev/null || echo 'local repo')..."
@@ -26,17 +85,17 @@ info "Updating tools from $(git -C "$TOOLS_DIR" remote get-url origin 2>/dev/nul
 local_changes=false
 if ! git -C "$TOOLS_DIR" diff --quiet 2>/dev/null; then
     info "Stashing local changes..."
-    git -C "$TOOLS_DIR" stash push -m "self-update $(date +%Y%m%d-%H%M%S)" --quiet
+    git -C "$TOOLS_DIR" stash push -m "self-update $(date +%Y%m%d-%H%M%S)" $QUIET_FLAG
     local_changes=true
 fi
 
 # Pull latest
-if git -C "$TOOLS_DIR" pull --rebase --quiet 2>/dev/null; then
+if git -C "$TOOLS_DIR" pull --rebase $QUIET_FLAG 2>/dev/null; then
     ok "Pulled latest changes"
 else
     err "Git pull failed. Check your network or remote configuration."
     if [[ "$local_changes" == true ]]; then
-        git -C "$TOOLS_DIR" stash pop --quiet 2>/dev/null || true
+        git -C "$TOOLS_DIR" stash pop $QUIET_FLAG 2>/dev/null || true
     fi
     exit 1
 fi
@@ -44,7 +103,7 @@ fi
 # Restore local changes
 if [[ "$local_changes" == true ]]; then
     info "Restoring local changes..."
-    git -C "$TOOLS_DIR" stash pop --quiet 2>/dev/null || {
+    git -C "$TOOLS_DIR" stash pop $QUIET_FLAG 2>/dev/null || {
         err "Could not auto-restore local changes. Run 'git -C $TOOLS_DIR stash pop' manually."
     }
 fi

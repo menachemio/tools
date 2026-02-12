@@ -19,8 +19,8 @@ load_cleanup_config() {
     local config_file="$1"
 
     if [[ ! -f "$config_file" ]]; then
-        log_warning "Config file not found: $config_file (using defaults)"
-        return 0
+        log_error "Config file not found: $config_file"
+        return 1
     fi
 
     if ! parse_yaml "$config_file"; then

@@ -185,16 +185,37 @@ do_uninstall() {
 }
 
 # ─── Entry point ──────────────────────────────────────────────────────
+VERBOSE=false
+if [[ "${1:-}" == "--verbose" || "${1:-}" == "-v" ]]; then
+    VERBOSE=true
+    shift
+fi
+
 case "${1:-install}" in
     install|"")   do_install ;;
     uninstall)    do_uninstall ;;
     update)       exec "$TOOLS_DIR/bin/self-update" ;;
     help|--help|-h)
-        echo "Usage: install.sh [install|uninstall|update|help]"
-        echo
-        echo "  install      Add tools/bin to PATH (default)"
-        echo "  uninstall    Remove all tools traces from the system"
-        echo "  update       Git pull + refresh"
+        cat << 'EOF'
+Tools Repository Installer
+
+Usage:
+  ./install.sh [COMMAND]
+
+Commands:
+  install      Add tools/bin to PATH (default if no command given)
+  uninstall    Remove all tools traces from the system
+  update       Pull latest changes and refresh (runs self-update)
+  help         Show this help
+
+Options:
+  -v, --verbose    Show detailed output
+
+Examples:
+  ./install.sh               Install tools
+  ./install.sh uninstall     Remove everything
+  ./install.sh update        Pull latest and refresh
+EOF
         ;;
     *)
         err "Unknown: $1"; echo "Run: install.sh help"; exit 1 ;;

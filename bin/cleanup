@@ -26,13 +26,13 @@ show_help() {
 Cleanup Utility — intelligent system cleaning
 
 Usage:
-  cleanup                     Interactive cleanup with prompts
-  cleanup --dry-run           Preview what would be cleaned
-  cleanup --auto              Auto-clean safe targets (no prompts)
-  cleanup --config <file>     Use YAML configuration file
-  cleanup --update            Also run system/tool updates
-  cleanup --verbose           Show detailed output
-  cleanup --help              Show this help
+  cleanup                          Interactive cleanup with prompts
+  cleanup -d, --dry-run            Preview what would be cleaned
+  cleanup -a, --auto               Auto-clean safe targets (no prompts)
+  cleanup -c, --config <file>      Use YAML configuration file
+  cleanup -u, --update             Also run system/tool updates
+  cleanup -v, --verbose            Show detailed output
+  cleanup -h, --help               Show this help
 
 Flags can be combined:
   cleanup --dry-run --update  Preview cleanup + updates
@@ -48,11 +48,11 @@ EOF
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --dry-run)   DRY_RUN=true ;;
-            --auto)      AUTO_MODE=true ;;
-            --verbose)   VERBOSE=true ;;
-            --update)    RUN_UPDATES=true ;;
-            --config)
+            --dry-run|-d)   DRY_RUN=true ;;
+            --auto|-a)      AUTO_MODE=true ;;
+            --verbose|-v)   VERBOSE=true ;;
+            --update|-u)    RUN_UPDATES=true ;;
+            --config|-c)
                 shift
                 CONFIG_FILE="${1:-}"
                 [[ -z "$CONFIG_FILE" ]] && { log_error "Missing config file path"; exit 1; }
@@ -81,7 +81,7 @@ main() {
 
     # Load configuration
     if [[ -n "$CONFIG_FILE" ]]; then
-        load_cleanup_config "$CONFIG_FILE"
+        load_cleanup_config "$CONFIG_FILE" || exit 1
     elif [[ -n "${CLEANUP_CONFIG:-}" && -f "$CLEANUP_CONFIG" ]]; then
         load_cleanup_config "$CLEANUP_CONFIG"
     elif [[ -f "$HOME/.config/tools/cleanup.yaml" ]]; then

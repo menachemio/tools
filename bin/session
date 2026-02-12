@@ -37,6 +37,13 @@ Usage:
 
   session install <config.yaml>      Register project as a command
 
+Options:
+  --headless            Start session in background (no attach)
+  --verbose, -v         Enable verbose/debug output
+  --help, -h            Show this help message
+
+Flags can be combined, e.g.: session myproject --verbose --headless
+
 Config lookup order:
   1. ./<session-name>.session.yaml
   2. ./.session.yaml
@@ -116,12 +123,18 @@ parse_args() {
                 ACTION="$1"
                 ;;
             *)
+                # Reject unknown flags
+                if [[ "$1" == --* || "$1" == -* ]]; then
+                    die "Unknown flag: $1. Try: session --help"
+                fi
                 # First unknown arg = session name (if not set via CONFIG_FILE env)
                 # Second unknown arg = subsession name
                 if [[ -z "$SESSION_NAME" && -z "${SESSION_CONFIG_FILE:-}" ]]; then
                     SESSION_NAME="$1"
                 elif [[ -z "$SUBSESSION_NAME" ]]; then
                     SUBSESSION_NAME="$1"
+                else
+                    die "Unexpected argument: $1"
                 fi
                 ;;
         esac
@@ -178,7 +191,7 @@ main() {
             stop)    stop_subsession "$SUBSESSION_NAME" ;;
             status)  echo "Subsession $SUBSESSION_NAME: $(subsession_status "$SUBSESSION_NAME")" ;;
             kill)    stop_subsession "$SUBSESSION_NAME" ;;
-            *)       die "Invalid action: $ACTION" ;;
+            *)       die "Unknown action: $ACTION (valid: start, stop, kill, status, restart)" ;;
         esac
         return 0
     fi
@@ -206,7 +219,7 @@ main() {
             sleep 2
             start_session
             ;;
-        *)        die "Unknown action: $ACTION" ;;
+        *)        die "Unknown action: $ACTION (valid: start, stop, kill, status, restart)" ;;
     esac
 }
 
