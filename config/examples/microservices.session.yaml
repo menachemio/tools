@@ -4,6 +4,23 @@ timezone: America/New_York
 show_utc: true
 color: colour202
 
+# Override default tmux options programmatically
+tmux:
+  # Global options (set-option -g): apply server-wide via tmux.conf
+  global:
+    mouse: on
+    status-position: top
+    status-interval: 2
+    pane-border-style: "fg=colour240"
+    pane-active-border-style: "fg=colour202,bold"
+
+  # Session options (set-option -t <session>): apply to this session at runtime
+  session:
+    status-style: "fg=white,bg=colour202"
+    status-left: "#[fg=black,bg=colour202,bold] MICRO #S #[default] "
+    status-right: "#[fg=colour202] %H:%M %Z #[default]"
+    status-justify: centre
+
 subsessions:
   auth-service:
     dir: ./services/auth
@@ -13,6 +30,10 @@ subsessions:
     dir: ./services/gateway
     command: npm run dev
     delay: 5
+    # Per-subsession tmux options (override color-derived styling)
+    tmux:
+      status-style: "fg=colour51,bg=default"
+      status-left: "#[fg=colour51,bold] GW #S #[default]"
 
   user-service:
     dir: ./services/users
@@ -26,6 +47,10 @@ subsessions:
 windows:
   - name: services
     color: colour51
+    # Per-window tmux options (set-window-option -t <session>:<window>)
+    tmux:
+      window-status-current-style: "fg=black,bg=colour51,bold"
+      window-status-style: "fg=colour51,bg=default,dim"
     panes:
       - type: subsession
         subsession: auth-service

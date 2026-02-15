@@ -3,9 +3,6 @@
 
 # yaml-parser.sh is sourced by core.sh before this file
 
-# Global subsession tracking
-declare -A ACTIVE_SUBSESSIONS
-
 # Check if a subsession exists and is running
 subsession_exists() {
     tmux has-session -t "$1" 2>/dev/null
@@ -18,6 +15,8 @@ start_subsession() {
     local command="$3"
     local delay="${4:-0}"
     local env_vars="$5"
+    local execute="${6:-true}"
+    local history="${7:-false}"
 
     if subsession_exists "$name"; then
         return 0
@@ -32,6 +31,9 @@ start_subsession() {
         log "Failed to create subsession $name"
         return 1
     fi
+
+    # Subsession baseline defaults (before color/tmux overrides)
+    tmux set-option -t "$name" status-justify left 2>/dev/null || true
 
     # Build export prefix from environment variables if provided
     local export_prefix=""
@@ -55,20 +57,34 @@ start_subsession() {
         fi
     fi
 
-    # Apply delay if specified
+    # Send command to the subsession pane
+    # If delay is set, fork a background subshell that waits then sends — the manager
+    # process continues immediately and the pane shows a clean command (no sleep &&)
+    _send_subsession_command() {
+        if [[ -n "$command" && "$command" != "bash" ]]; then
+            if [[ "$execute" == "false" ]]; then
+                # Pre-fill command text without executing (env vars still exported first)
+                if [[ -n "$export_prefix" ]]; then
+                    tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix%%; }" Enter 2>/dev/null || true
+                fi
+                tmux send-keys -t "$name" "$command" 2>/dev/null || true
+            else
+                tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix}${command}" Enter 2>/dev/null || true
+                if [[ "$history" == "true" ]]; then
+                    echo "$command" >> ~/.bash_history
+                fi
+            fi
+        elif [[ -n "$export_prefix" ]]; then
+            tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix%%; }" Enter 2>/dev/null || true
+        fi
+    }
+
     if [[ "${delay:-0}" -gt 0 ]]; then
-        sleep "$delay"
+        ( sleep "$delay"; _send_subsession_command ) &
+    else
+        _send_subsession_command
     fi
 
-    # Send command if provided, with env exports prepended
-    if [[ -n "$command" && "$command" != "bash" ]]; then
-        tmux send-keys -t "$name" "${export_prefix}${command}" Enter 2>/dev/null || true
-    elif [[ -n "$export_prefix" ]]; then
-        # Even if no command (or command is bash), still export the env vars
-        tmux send-keys -t "$name" "${export_prefix%%; }" Enter 2>/dev/null || true
-    fi
-
-    ACTIVE_SUBSESSIONS["$name"]="$dir"
     exclude_from_resurrect "$name"
     return 0
 }
@@ -83,7 +99,7 @@ attach_pane_to_subsession() {
         return 1
     fi
 
-    tmux send-keys -t "$pane" "TMUX= tmux attach-session -t $subsession || exec bash" Enter 2>/dev/null || return 1
+    tmux send-keys -t "$pane" "${HIST_SKIP}TMUX= tmux attach-session -t $subsession || exec bash" Enter 2>/dev/null || return 1
     return 0
 }
 
@@ -96,8 +112,7 @@ stop_subsession() {
         return 0
     fi
 
-    tmux kill-session -t "$name"
-    unset ACTIVE_SUBSESSIONS["$name"]
+    tmux kill-session -t "$name" 2>/dev/null || true
     log "Stopped subsession: $name"
     return 0
 }
@@ -110,6 +125,8 @@ restart_subsession() {
     local command=$(yaml_get_subsession "$name" "command")
     local delay=$(yaml_get_subsession "$name" "delay")
     local env_vars=$(yaml_get_subsession "$name" "env")
+    local execute=$(yaml_get_subsession "$name" "execute")
+    local history=$(yaml_get_subsession "$name" "history")
 
     [[ -z "$dir" ]] && dir="."
     dir=$(resolve_dir "$dir")
@@ -119,8 +136,9 @@ restart_subsession() {
         sleep 1
     fi
 
-    start_subsession "$name" "$dir" "$command" "$delay" "$env_vars"
+    start_subsession "$name" "$dir" "$command" "$delay" "$env_vars" "$execute" "$history"
     _apply_subsession_color "$name"
+    apply_tmux_subsession_options "$name"
 }
 
 # Get subsession status
@@ -140,6 +158,8 @@ ensure_subsession() {
     local command=$(yaml_get_subsession "$name" "command")
     local delay=$(yaml_get_subsession "$name" "delay")
     local env_vars=$(yaml_get_subsession "$name" "env")
+    local execute=$(yaml_get_subsession "$name" "execute")
+    local history=$(yaml_get_subsession "$name" "history")
 
     if [[ -z "$dir" ]]; then
         log "No configuration found for subsession $name"
@@ -147,8 +167,9 @@ ensure_subsession() {
     fi
 
     dir=$(resolve_dir "$dir")
-    start_subsession "$name" "$dir" "$command" "$delay" "$env_vars"
+    start_subsession "$name" "$dir" "$command" "$delay" "$env_vars" "$execute" "$history"
     _apply_subsession_color "$name"
+    apply_tmux_subsession_options "$name"
 }
 
 # Internal: find and apply the color for a subsession based on its parent window
@@ -160,7 +181,14 @@ _apply_subsession_color() {
         TIMEZONE_SCRIPT=$(create_timezone_script)
     fi
 
-    # Find which window references this subsession and use that window's color
+    # Subsession-level color takes priority over window color
+    local sub_color=$(yaml_get_subsession "$name" "color")
+    if [[ -n "$sub_color" ]]; then
+        apply_subsession_colors "$name" "$sub_color" "$TIMEZONE_SCRIPT"
+        return 0
+    fi
+
+    # Fall back to parent window's color
     while IFS= read -r win_name; do
         [[ -z "$win_name" ]] && continue
         local pcount=$(yaml_get_pane_count "$win_name")
@@ -177,7 +205,7 @@ _apply_subsession_color() {
     done < <(yaml_get_windows)
 }
 
-# Apply color scheme to subsession
+# Apply color scheme to subsession (uses shared _apply_color_defaults from core.sh)
 apply_subsession_colors() {
     local name="$1"
     local color="$2"
@@ -186,31 +214,14 @@ apply_subsession_colors() {
     [[ -z "$color" ]] && return
     subsession_exists "$name" || return
 
-    tmux set-option -t "$name" status-style "fg=${color},bg=default"
-    tmux set-option -t "$name" status-left "#[fg=${color},bold] #S #[default]"
-    if [[ -n "$timezone_script" ]]; then
-        tmux set-option -t "$name" status-right "#[fg=${color}] #($timezone_script) #[default]"
-    fi
+    _apply_color_defaults "$name" "$color" "$timezone_script" \
+        "$(yaml_get_tmux_subsession "$name" "status-style")" \
+        "$(yaml_get_tmux_subsession "$name" "status-left")" \
+        "$(yaml_get_tmux_subsession "$name" "status-right")"
 }
 
-# Exclude session from tmux-resurrect if available
-exclude_from_resurrect() {
-    local session_name="$1"
-
-    if ! tmux show-option -gv @resurrect-save-session-ignore &>/dev/null; then
-        return 0
-    fi
-
-    local current_ignore
-    current_ignore=$(tmux show-option -gv @resurrect-save-session-ignore 2>/dev/null || echo "")
-
-    if [[ ",$current_ignore," == *",$session_name,"* ]]; then
-        return 0
-    fi
-
-    if [[ -z "$current_ignore" ]]; then
-        tmux set-option -g @resurrect-save-session-ignore "$session_name"
-    else
-        tmux set-option -g @resurrect-save-session-ignore "${current_ignore},${session_name}"
-    fi
+# Apply per-subsession tmux options from YAML (uses shared _apply_tmux_opts from core.sh)
+apply_tmux_subsession_options() {
+    subsession_exists "$1" || return
+    _apply_tmux_opts "$1" "set-option" "tmux_subsession_${1}_"
 }
