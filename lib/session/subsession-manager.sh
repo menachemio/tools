@@ -27,7 +27,10 @@ start_subsession() {
         return 1
     fi
 
-    if ! tmux new-session -d -s "$name" -c "$dir" 2>/dev/null; then
+    local tmux_conf="${TOOLS_RUNTIME_DIR}/session-tmux.conf"
+    local tmux_new_flags=()
+    [[ -f "$tmux_conf" ]] && tmux_new_flags+=(-f "$tmux_conf")
+    if ! tmux "${tmux_new_flags[@]}" new-session -d -s "$name" -c "$dir" 2>/dev/null; then
         log "Failed to create subsession $name"
         return 1
     fi
@@ -93,12 +96,16 @@ start_subsession() {
 attach_pane_to_subsession() {
     local pane="$1"
     local subsession="$2"
+    local cmd="${3:-}"
 
     if ! subsession_exists "$subsession"; then
         log "Subsession $subsession does not exist"
         return 1
     fi
 
+    if [[ -n "$cmd" ]]; then
+        tmux send-keys -t "$subsession" "${HIST_SKIP}$cmd" Enter 2>/dev/null || true
+    fi
     tmux send-keys -t "$pane" "${HIST_SKIP}TMUX= tmux attach-session -t $subsession || exec bash" Enter 2>/dev/null || return 1
     return 0
 }

@@ -351,12 +351,15 @@ _apply_color_defaults() {
 
     [[ -z "$color" ]] && return
 
-    [[ -z "$ov_style" ]] && \
+    if [[ -z "$ov_style" ]]; then
         tmux set-option -t "$target" status-style "fg=${color},bg=default" 2>/dev/null || true
-    [[ -z "$ov_left" ]] && \
+    fi
+    if [[ -z "$ov_left" ]]; then
         tmux set-option -t "$target" status-left "#[fg=${color},bold] #S #[default]" 2>/dev/null || true
-    [[ -n "$timezone_script" && -z "$ov_right" ]] && \
+    fi
+    if [[ -n "$timezone_script" && -z "$ov_right" ]]; then
         tmux set-option -t "$target" status-right "#[fg=${color}] #($timezone_script) #[default]" 2>/dev/null || true
+    fi
 }
 
 apply_session_colors() {
@@ -396,6 +399,9 @@ create_pane_layout() {
     local height=$(tmux display-message -t "$target" -p "#{window_height}")
     if [[ $width -lt 20 || $height -lt 10 ]]; then
         tmux resize-window -t "$target" -x 80 -y 24 2>/dev/null || true
+        width=$(tmux display-message -t "$target" -p "#{window_width}")
+        height=$(tmux display-message -t "$target" -p "#{window_height}")
+        log "Post-resize dimensions: ${width}x${height}"
     fi
 
     case $pane_count in
@@ -424,6 +430,9 @@ create_pane_layout() {
     wait_for_target "$target" || true
     local actual=$(tmux list-panes -t "$target" | wc -l)
     log "Window $target: requested $pane_count, created $actual panes"
+    if [[ $actual -lt $pane_count ]]; then
+        echo "WARNING: Window $target: only $actual of $pane_count panes created (split-window may have failed)" >&2
+    fi
 }
 
 # Setup individual pane
@@ -439,12 +448,18 @@ setup_pane() {
         "subsession")
             local subsession_name=$(yaml_get_pane "$window_name" "$pane_index" "subsession")
             if [[ -n "$subsession_name" ]]; then
+                local pane_cmd=$(yaml_get_pane "$window_name" "$pane_index" "cmd")
                 ensure_subsession "$subsession_name"
                 wait_for_target "$pane_target" || true
-                attach_pane_to_subsession "$pane_target" "$subsession_name"
+                attach_pane_to_subsession "$pane_target" "$subsession_name" "$pane_cmd"
             fi
             ;;
         "command")
+            if ! tmux display-message -t "$pane_target" -p "#{pane_id}" &>/dev/null; then
+                log "Pane $pane_target does not exist, skipping command setup"
+                return
+            fi
+
             local cmd=$(yaml_get_pane "$window_name" "$pane_index" "cmd")
             local execute=$(yaml_get_pane "$window_name" "$pane_index" "execute")
             local history=$(yaml_get_pane "$window_name" "$pane_index" "history")
@@ -543,8 +558,27 @@ start_session() {
 
     command -v tmux >/dev/null || die "tmux not found"
 
-    TIMEZONE_SCRIPT=$(create_timezone_script)
-    create_tmux_config "$TIMEZONE_SCRIPT"
+    # Regenerate config if missing (bin/session pre-generates, but restart deletes it)
+    if [[ ! -f "${TOOLS_RUNTIME_DIR}/session-tmux.conf" ]]; then
+        TIMEZONE_SCRIPT=$(create_timezone_script)
+        create_tmux_config "$TIMEZONE_SCRIPT"
+    fi
+
+    # Warn about missing binaries referenced in pane commands and subsessions
+    local _key _val _bin
+    local -A _seen_bins
+    for _key in "${!YAML_VALUES[@]}"; do
+        case "$_key" in
+            window_*_pane_*_cmd)    _val="${YAML_VALUES[$_key]}" ;;
+            subsession_*_command)   _val="${YAML_VALUES[$_key]}" ;;
+            *)                      continue ;;
+        esac
+        _bin="${_val%% *}"
+        [[ -z "$_bin" || -n "${_seen_bins[$_bin]+x}" ]] && continue
+        _seen_bins["$_bin"]=1
+        command -v "$_bin" >/dev/null 2>&1 || \
+            log "WARNING: '$_bin' not found in PATH (referenced in config)"
+    done
 
     # If session exists, just attach
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
@@ -567,18 +601,15 @@ start_session() {
     [[ -z "$first_win_dir" ]] && first_win_dir="."
     first_win_dir=$(resolve_dir "$first_win_dir")
 
-    # Create main session with our config as authoritative source
-    # -f bypasses ~/.tmux.conf on fresh server start (no plugin conflicts)
-    # source-file covers the case where server was already running (-f ignored)
+    # Create main session (-f bypasses ~/.tmux.conf on fresh server start)
+    # bin/session already sourced config for existing servers; -f handles new servers
     tmux -f "${TOOLS_RUNTIME_DIR}/session-tmux.conf" new-session -d -s "$SESSION_NAME" -c "$first_win_dir" || \
         die "Failed to create tmux session: $SESSION_NAME"
-    tmux source-file "${TOOLS_RUNTIME_DIR}/session-tmux.conf" 2>/dev/null || \
-        log "Warning: failed to source tmux config (continuing with -f defaults)"
     tmux set-option -u window-size 2>/dev/null || true
     exclude_from_resurrect "$SESSION_NAME"
     apply_session_colors "$SESSION_NAME" "$TIMEZONE_SCRIPT"
 
-    # Pre-create all subsessions
+    # Pre-create all subsessions and apply their colors/options in one pass
     log "Pre-creating subsessions..."
     while IFS= read -r sub_name; do
         [[ -z "$sub_name" ]] && continue
@@ -593,12 +624,7 @@ start_session() {
         [[ -z "$sub_dir" ]] && sub_dir="."
         sub_dir=$(resolve_dir "$sub_dir")
 
-        start_subsession "$sub_name" "$sub_dir" "$sub_cmd" "${sub_delay:-0}" "$sub_env" "$sub_execute" "$sub_history"
-    done < <(yaml_get_subsessions)
-
-    # Apply subsession colors + tmux options (uses _apply_subsession_color from subsession-manager.sh)
-    while IFS= read -r sub_name; do
-        [[ -z "$sub_name" ]] && continue
+        start_subsession "$sub_name" "$sub_dir" "$sub_cmd" "${sub_delay:-0}" "$sub_env" "$sub_execute" "$sub_history" || continue
         _apply_subsession_color "$sub_name"
         apply_tmux_subsession_options "$sub_name"
     done < <(yaml_get_subsessions)
