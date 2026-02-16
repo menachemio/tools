@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ claude-usage — Live Claude Code usage via undocumented Anthropic API ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+#
+# ── HOW THIS WORKS (read this if something breaks) ───────────────────
+#
+# Claude Code stores OAuth credentials at ~/.claude/.credentials.json:
+#   {
+#     "claudeAiOauth": {
+#       "accessToken": "sk-ant-oat01-...",   <-- Bearer token for API calls
+#       "refreshToken": "sk-ant-ort01-...",   <-- Used to get new access tokens
+#       "expiresAt": <epoch_ms>,              <-- Access token expiry (~8 hours)
+#       "subscriptionType": "max"
+#     }
+#   }
+#
+# The access token DOES NOT work against the public API (api.anthropic.com/v1/).
+# It returns: "OAuth authentication is currently not supported."
+#
+# However, Claude Code uses INTERNAL endpoints under /api/oauth/ which DO
+# accept this token — but ONLY with a special beta header. Without it, the
+# same 401 "OAuth authentication is currently not supported" error occurs.
+#
+# ── THE CRITICAL HEADER ──────────────────────────────────────────────
+#
+#   anthropic-beta: oauth-2025-04-20
+#
+# This was extracted from the Claude Code binary (v2.1.42) at:
+#   ~/.local/share/claude/versions/<version>
+# by running:
+#   strings <binary> | grep -oP 'AY="[^"]*"'
+#   → AY="oauth-2025-04-20"
+#
+# The binary's IU() auth function constructs headers as:
+#   { Authorization: "Bearer <accessToken>", "anthropic-beta": AY }
+#
+# If Anthropic changes this beta header value in a future Claude Code
+# version, update BETA_HEADER below. To find the new value:
+#   strings ~/.local/share/claude/versions/$(claude --version) | grep 'AY="'
+#
+# ── ENDPOINTS USED ───────────────────────────────────────────────────
+#
+# GET /api/oauth/usage
+#   Returns rate limit utilization for the current subscription.
+#   Response:
+#   {
+#     "five_hour":  { "utilization": 54.0, "resets_at": "2026-02-16T23:00:00Z" },
+#     "seven_day":  { "utilization": 3.0,  "resets_at": "2026-02-23T20:00:00Z" },
+#     "seven_day_opus": null | { ... },
+#     "seven_day_sonnet": null | { "utilization": 3.0, "resets_at": "..." },
+#     "seven_day_cowork": null | { ... },
+#     "extra_usage": { "is_enabled": false, ... }
+#   }
+#   - "utilization" is a percentage (0-100) of the rate limit consumed.
+#   - "resets_at" is RFC3339 timestamp when the window resets.
+#   - Model-specific seven_day fields may be null if unused.
+#
+# GET /api/oauth/profile
+#   Returns account + org info. Used to display plan type.
+#   Response:
+#   {
+#     "account": { "uuid": "...", "display_name": "...", "has_claude_max": true },
+#     "organization": {
+#       "uuid": "...",
+#       "organization_type": "claude_max",    <-- "claude_pro" | "claude_max"
+#       "rate_limit_tier": "default_claude_max_5x",
+#       "subscription_status": "active"
+#     }
+#   }
+#
+# GET /api/oauth/claude_cli/roles
+#   Returns org UUID, name, and role. Useful to get org ID programmatically.
+#   Response:
+#   {
+#     "organization_uuid": "123a51a3-...",
+#     "organization_name": "...",
+#     "organization_role": "admin"
+#   }
+#
+# ── TOKEN REFRESH ────────────────────────────────────────────────────
+#
+# Access tokens expire every ~8 hours. Claude Code auto-refreshes them,
+# so this script just reads the current token. If the token is expired
+# and Claude Code hasn't refreshed it, API calls will fail gracefully
+# and the script outputs "?" for unknown values.
+#
+# Manual refresh (if needed):
+#   curl -X POST https://platform.claude.com/v1/oauth/token \
+#     -H "Content-Type: application/json" \
+#     -d '{"grant_type":"refresh_token","refresh_token":"<refreshToken>",
+#          "client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e"}'
+#
+# ── USAGE ────────────────────────────────────────────────────────────
+#
+#   claude-usage [OPTIONS]
+#
+#   Options:
+#     --time-format countdown   Reset as countdown: "4h30m" (default)
+#     --time-format clock       Reset as wall-clock: "18:00" (default 24h)
+#     --clock-format 24h        24-hour clock: "18:00" (default)
+#     --clock-format 12h        12-hour clock: "6:00 PM"
+#     --timezone ZONE           Timezone for clock & --with-time (default: UTC)
+#                               e.g. "America/New_York", "Europe/London"
+#     --timezone-from-config F  Read timezone from a session YAML file's
+#                               "timezone:" field. --timezone takes priority.
+#     --with-time               Append current clock to the output
+#     --cache-ttl SECS          Cache API responses for SECS seconds.
+#                               Without this flag, every call hits the API.
+#                               Recommended: 15-60 for tmux status bars.
+#
+#   Examples:
+#     claude-usage
+#       ⚡ 5h 54% 2h05m | 7d 3% 6d22h | max
+#
+#     claude-usage --time-format clock --timezone America/New_York
+#       ⚡ 5h 54% 18:00 | 7d 3% 6d22h | max
+#
+#     claude-usage --time-format clock --clock-format 12h --timezone America/New_York
+#       ⚡ 5h 54% 6:00 PM | 7d 3% 6d22h | max
+#
+#     claude-usage --with-time --timezone America/New_York --cache-ttl 15
+#       ⚡ 5h 54% 2h05m | 7d 3% 6d22h | max | 15:30 EST
+#
+#   tmux status-right (session manager):
+#     "#(claude-usage --with-time --cache-ttl 15 --timezone-from-config /path/to/config.yaml)"
+#
+# ── DISCOVERY LOG ────────────────────────────────────────────────────
+#
+# 2026-02-16: Reverse-engineered from Claude Code v2.1.42 binary.
+#   - Bearer auth against api.anthropic.com/v1/ → "OAuth not supported"
+#   - Bearer auth against claude.ai/api/ → Cloudflare 403 (bot challenge)
+#   - console.anthropic.com redirects to platform.claude.com
+#   - platform.claude.com/v1/oauth/hello → 200 (token valid!)
+#   - Extracted all /api/ paths from binary via: strings <bin> | grep "/api/"
+#   - Found /api/oauth/usage exists (401, not 404) but rejected without beta
+#   - Extracted beta header from binary: AY="oauth-2025-04-20"
+#   - With beta header → 200! Full usage data returned.
+#
+# ═════════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+# ── Defaults & CLI parsing ────────────────────────────────────────────
+
+CREDS_FILE="${HOME}/.claude/.credentials.json"
+API_BASE="https://api.anthropic.com"
+BETA_HEADER="oauth-2025-04-20"
+TIME_FORMAT="countdown"   # "countdown" or "clock"
+CLOCK_FORMAT="24h"        # "24h" (18:00) or "12h" (6:00 PM)
+TIMEZONE=""                # empty = UTC, set via --timezone or --timezone-from-config
+CONFIG_FILE=""             # --timezone-from-config <path>
+CACHE_TTL=""               # empty = no caching; seconds between API refreshes if set
+CACHE_DIR="${XDG_RUNTIME_DIR:-${HOME}/.cache}/claude-usage"
+SHOW_TIME=false            # --with-time: append current clock to output
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --time-format)          TIME_FORMAT="$2"; shift 2 ;;
+        --clock-format)         CLOCK_FORMAT="$2"; shift 2 ;;
+        --timezone)             TIMEZONE="$2";    shift 2 ;;
+        --timezone-from-config) CONFIG_FILE="$2"; shift 2 ;;
+        --cache-ttl)            CACHE_TTL="$2";   shift 2 ;;
+        --with-time)            SHOW_TIME=true;    shift ;;
+        *)                      shift ;;
+    esac
+done
+
+# --timezone-from-config: extract "timezone:" from the YAML, but only if
+# --timezone wasn't explicitly provided (explicit flag wins).
+if [[ -z "$TIMEZONE" && -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
+    tz_from_config=$(sed -n 's/^timezone:\s*//p' "$CONFIG_FILE" | tr -d '[:space:]')
+    [[ -n "$tz_from_config" ]] && TIMEZONE="$tz_from_config"
+fi
+TIMEZONE="${TIMEZONE:-UTC}"
+
+# ── Preflight ─────────────────────────────────────────────────────────
+
+if ! command -v jq &>/dev/null; then
+    echo "jq required"; exit 1
+fi
+if [[ ! -f "$CREDS_FILE" ]]; then
+    echo "no credentials"; exit 1
+fi
+
+ACCESS_TOKEN=$(jq -r '.claudeAiOauth.accessToken' "$CREDS_FILE")
+if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" ]]; then
+    echo "no token"; exit 1
+fi
+
+AUTH_HEADERS=(-H "Authorization: Bearer $ACCESS_TOKEN" -H "anthropic-beta: $BETA_HEADER")
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+# Format an ISO 8601 reset timestamp as a countdown: "6d22h", "4h30m", "45m", "now"
+# >=24h → days+hours, <24h → hours+minutes, <1h → minutes
+fmt_countdown() {
+    local reset_ts="$1"
+    [[ -z "$reset_ts" || "$reset_ts" == "null" ]] && return
+
+    local reset_epoch now_epoch diff_secs diff_mins
+    reset_epoch=$(date -d "$reset_ts" +%s 2>/dev/null) || return
+    now_epoch=$(date +%s)
+    diff_secs=$(( reset_epoch - now_epoch ))
+    diff_mins=$(( diff_secs / 60 ))
+
+    if (( diff_mins >= 1440 )); then
+        # >=24h: show days + hours
+        printf "%dd%dh" "$(( diff_mins / 1440 ))" "$(( (diff_mins % 1440) / 60 ))"
+    elif (( diff_mins >= 60 )); then
+        # <24h: show hours + minutes
+        printf "%dh%02dm" "$(( diff_mins / 60 ))" "$(( diff_mins % 60 ))"
+    elif (( diff_mins > 0 )); then
+        printf "%dm" "$diff_mins"
+    else
+        printf "now"
+    fi
+}
+
+# Format an ISO 8601 reset timestamp as a wall-clock time in $TIMEZONE.
+# Respects $CLOCK_FORMAT: "24h" → "18:00", "12h" → "6:00 PM"
+fmt_clock() {
+    local reset_ts="$1"
+    [[ -z "$reset_ts" || "$reset_ts" == "null" ]] && return
+
+    local reset_epoch now_epoch diff_secs
+    reset_epoch=$(date -d "$reset_ts" +%s 2>/dev/null) || return
+    now_epoch=$(date +%s)
+    diff_secs=$(( reset_epoch - now_epoch ))
+
+    local time_fmt
+    if [[ "$CLOCK_FORMAT" == "12h" ]]; then
+        time_fmt="%-I:%M %p"
+    else
+        time_fmt="%H:%M"
+    fi
+
+    if (( diff_secs > 0 )); then
+        TZ="$TIMEZONE" date -d "$reset_ts" +"$time_fmt" 2>/dev/null || printf "?"
+    else
+        printf "now"
+    fi
+}
+
+# Route to the right formatter based on --time-format.
+# Clock mode only applies under 24h — beyond that, days+hours countdown
+# is more useful than "Mon 8:00 PM" (you already know what day it is).
+fmt_reset() {
+    local reset_ts="$1"
+    [[ -z "$reset_ts" || "$reset_ts" == "null" ]] && return
+
+    local reset_epoch now_epoch diff_secs
+    reset_epoch=$(date -d "$reset_ts" +%s 2>/dev/null) || return
+    now_epoch=$(date +%s)
+    diff_secs=$(( reset_epoch - now_epoch ))
+
+    if [[ "$TIME_FORMAT" == "clock" ]] && (( diff_secs > 0 && diff_secs < 86400 )); then
+        fmt_clock "$1"
+    else
+        fmt_countdown "$1"
+    fi
+}
+
+# Format a single rate-limit period: "<label> <pct>% <reset>"
+# e.g. "5h 54% 2h05m" or "7d 3% 6d22h"
+fmt_period() {
+    local label="$1" pct="$2" reset_ts="$3"
+    local reset_display
+    reset_display=$(fmt_reset "$reset_ts") || reset_display=""
+
+    # Strip trailing .0 from percentage (54.0 → 54)
+    pct="${pct%%\.0}"
+
+    local out="${label} ${pct}%"
+    if [[ -n "$reset_display" ]]; then
+        out+=" ${reset_display}"
+    fi
+    printf "%s" "$out"
+}
+
+# ── Cache helpers ─────────────────────────────────────────────────────
+# When --cache-ttl is set, API responses are cached to disk. Subsequent
+# calls within the TTL read from cache instead of hitting the network.
+# Without --cache-ttl, every invocation makes a fresh API call.
+
+CACHE_USAGE="${CACHE_DIR}/usage.json"
+CACHE_PROFILE="${CACHE_DIR}/profile.json"
+
+# Check if a cache file is fresh (modified within TTL seconds).
+cache_fresh() {
+    local file="$1"
+    [[ -z "$CACHE_TTL" ]] && return 1          # caching disabled
+    [[ ! -f "$file" ]] && return 1             # no cache yet
+    local now file_age
+    now=$(date +%s)
+    file_age=$(stat -c %Y "$file" 2>/dev/null) || return 1
+    (( (now - file_age) < CACHE_TTL ))
+}
+
+# Fetch with optional caching. Args: <url> <cache_file>
+# Prints the JSON to stdout.
+fetch_cached() {
+    local url="$1" cache_file="$2"
+    if cache_fresh "$cache_file"; then
+        cat "$cache_file"
+        return
+    fi
+    local data
+    data=$(curl -sf --max-time 5 "$url" \
+        "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" 2>/dev/null) || data=""
+    if [[ -n "$data" && -n "$CACHE_TTL" ]]; then
+        mkdir -p "$CACHE_DIR" 2>/dev/null
+        printf "%s" "$data" > "$cache_file"
+    fi
+    printf "%s" "$data"
+}
+
+# ── Fetch live usage ──────────────────────────────────────────────────
+
+usage_json=$(fetch_cached "${API_BASE}/api/oauth/usage" "$CACHE_USAGE")
+
+if [[ -n "$usage_json" ]]; then
+    five_pct=$(echo "$usage_json"  | jq -r '.five_hour.utilization // 0')
+    five_reset=$(echo "$usage_json" | jq -r '.five_hour.resets_at // empty')
+    seven_pct=$(echo "$usage_json"  | jq -r '.seven_day.utilization // 0')
+    seven_reset=$(echo "$usage_json" | jq -r '.seven_day.resets_at // empty')
+else
+    five_pct="?"
+    five_reset=""
+    seven_pct="?"
+    seven_reset=""
+fi
+
+# ── Fetch plan info ───────────────────────────────────────────────────
+
+profile_json=$(fetch_cached "${API_BASE}/api/oauth/profile" "$CACHE_PROFILE")
+
+if [[ -n "$profile_json" ]]; then
+    plan=$(echo "$profile_json" | jq -r '.organization.organization_type // "unknown"' | sed 's/claude_//')
+else
+    plan="?"
+fi
+
+# ── Output ────────────────────────────────────────────────────────────
+
+five_display=$(fmt_period "5h" "$five_pct" "$five_reset")
+seven_display=$(fmt_period "7d" "$seven_pct" "$seven_reset")
+
+output="⚡ ${five_display} | ${seven_display} | ${plan}"
+
+if [[ "$SHOW_TIME" == "true" ]]; then
+    if [[ "$CLOCK_FORMAT" == "12h" ]]; then
+        current_time=$(TZ="$TIMEZONE" date "+%-I:%M %p %Z")
+    else
+        current_time=$(TZ="$TIMEZONE" date "+%H:%M %Z")
+    fi
+    output+=" | ${current_time}"
+fi
+
+echo "$output"
