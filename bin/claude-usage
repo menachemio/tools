@@ -162,7 +162,10 @@ while [[ $# -gt 0 ]]; do
         --timezone-from-config) CONFIG_FILE="$2"; shift 2 ;;
         --cache-ttl)            CACHE_TTL="$2";   shift 2 ;;
         --with-time)            SHOW_TIME=true;    shift ;;
-        *)                      shift ;;
+        -h|--help)
+            sed -n '/^# ── USAGE/,/^# ── DISCOVERY/{ /^# ── DISCOVERY/d; p; }' "$0" | sed 's/^# \{0,3\}//'
+            exit 0 ;;
+        *)  echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
@@ -269,7 +272,7 @@ fmt_period() {
     reset_display=$(fmt_reset "$reset_ts") || reset_display=""
 
     # Strip trailing .0 from percentage (54.0 → 54)
-    pct="${pct%%\.0}"
+    pct="${pct%%.0}"
 
     local out="${label} ${pct}%"
     if [[ -n "$reset_display" ]]; then
@@ -310,7 +313,11 @@ fetch_cached() {
         "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" 2>/dev/null) || data=""
     if [[ -n "$data" && -n "$CACHE_TTL" ]]; then
         mkdir -p "$CACHE_DIR" 2>/dev/null
-        printf "%s" "$data" > "$cache_file"
+        local tmp
+        tmp=$(mktemp "$CACHE_DIR/.tmp.XXXXXX") && {
+            printf "%s" "$data" > "$tmp"
+            mv -f "$tmp" "$cache_file"
+        }
     fi
     printf "%s" "$data"
 }
@@ -320,10 +327,13 @@ fetch_cached() {
 usage_json=$(fetch_cached "${API_BASE}/api/oauth/usage" "$CACHE_USAGE")
 
 if [[ -n "$usage_json" ]]; then
-    five_pct=$(echo "$usage_json"  | jq -r '.five_hour.utilization // 0')
-    five_reset=$(echo "$usage_json" | jq -r '.five_hour.resets_at // empty')
-    seven_pct=$(echo "$usage_json"  | jq -r '.seven_day.utilization // 0')
-    seven_reset=$(echo "$usage_json" | jq -r '.seven_day.resets_at // empty')
+    IFS=$'\t' read -r five_pct five_reset seven_pct seven_reset < <(
+        echo "$usage_json" | jq -r '[
+            (.five_hour.utilization  // 0 | tostring),
+            (.five_hour.resets_at    // ""),
+            (.seven_day.utilization  // 0 | tostring),
+            (.seven_day.resets_at    // "")
+        ] | join("\t")')
 else
     five_pct="?"
     five_reset=""
@@ -336,7 +346,7 @@ fi
 profile_json=$(fetch_cached "${API_BASE}/api/oauth/profile" "$CACHE_PROFILE")
 
 if [[ -n "$profile_json" ]]; then
-    plan=$(echo "$profile_json" | jq -r '.organization.organization_type // "unknown"' | sed 's/claude_//')
+    plan=$(echo "$profile_json" | jq -r '(.organization.organization_type // "unknown") | sub("^claude_"; "")')
 else
     plan="?"
 fi
