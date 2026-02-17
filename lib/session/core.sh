@@ -699,6 +699,62 @@ show_session_status() {
     done < <(yaml_get_subsessions)
 }
 
+# Refresh tmux settings for running session without restarting processes
+refresh_session() {
+    if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        die "Session '$SESSION_NAME' is not running"
+    fi
+
+    log "Refreshing session: $SESSION_NAME"
+
+    # Regenerate timezone script and tmux config, then re-source
+    TIMEZONE_SCRIPT=$(create_timezone_script)
+    create_tmux_config "$TIMEZONE_SCRIPT"
+    tmux source-file "${TOOLS_RUNTIME_DIR}/session-tmux.conf" 2>/dev/null || true
+
+    # Re-apply session-level colors and options
+    apply_session_colors "$SESSION_NAME" "$TIMEZONE_SCRIPT"
+
+    # Re-apply per-window styling
+    local running_windows
+    running_windows=$(tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null) || running_windows=""
+    while IFS= read -r window_name; do
+        [[ -z "$window_name" ]] && continue
+
+        # Skip windows not present in the running session
+        if ! grep -qxF "$window_name" <<< "$running_windows"; then
+            log "Window '$window_name' not in running session, skipping"
+            continue
+        fi
+
+        # Re-apply legacy color: styling
+        local window_color
+        window_color=$(yaml_get_window "$window_name" "color")
+        if [[ -n "$window_color" ]]; then
+            tmux set-window-option -t "$SESSION_NAME:$window_name" window-status-current-style "fg=white,bg=$window_color,bold" 2>/dev/null || true
+            tmux set-window-option -t "$SESSION_NAME:$window_name" window-status-style "fg=$window_color,bg=default" 2>/dev/null || true
+        fi
+
+        # Re-apply per-window tmux options
+        apply_tmux_window_options "$SESSION_NAME" "$window_name"
+    done < <(yaml_get_windows)
+
+    # Re-apply per-subsession styling
+    while IFS= read -r sub_name; do
+        [[ -z "$sub_name" ]] && continue
+
+        if ! subsession_exists "$sub_name"; then
+            log "Subsession '$sub_name' not running, skipping"
+            continue
+        fi
+
+        _apply_subsession_color "$sub_name"
+        apply_tmux_subsession_options "$sub_name"
+    done < <(yaml_get_subsessions)
+
+    echo "Refreshed session '$SESSION_NAME'"
+}
+
 # Kill all sessions and subsessions
 kill_all_sessions() {
     local sessions=()

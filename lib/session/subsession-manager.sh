@@ -148,6 +148,24 @@ restart_subsession() {
     apply_tmux_subsession_options "$name"
 }
 
+# Refresh a subsession's tmux settings without restarting it
+refresh_subsession() {
+    local name="$1"
+
+    if ! subsession_exists "$name"; then
+        die "Subsession '$name' is not running"
+    fi
+
+    if [[ -z "${TIMEZONE_SCRIPT:-}" ]]; then
+        TIMEZONE_SCRIPT=$(create_timezone_script)
+    fi
+
+    _apply_subsession_color "$name"
+    apply_tmux_subsession_options "$name"
+
+    echo "Refreshed subsession '$name'"
+}
+
 # Get subsession status
 subsession_status() {
     if subsession_exists "$1"; then echo "running"; else echo "stopped"; fi

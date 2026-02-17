@@ -105,6 +105,9 @@
 #     --timezone-from-config F  Read timezone from a session YAML file's
 #                               "timezone:" field. --timezone takes priority.
 #     --with-time               Append current clock to the output
+#     --no-5h                   Hide the 5-hour usage period
+#     --no-7d                   Hide the 7-day usage period
+#     --no-plan                 Hide the plan type (e.g. "max")
 #     --cache-ttl SECS          Cache API responses for SECS seconds.
 #                               Without this flag, every call hits the API.
 #                               Recommended: 15-60 for tmux status bars.
@@ -121,6 +124,12 @@
 #
 #     claude-usage --with-time --timezone America/New_York --cache-ttl 15
 #       ⚡ 5h 54% 2h05m | 7d 3% 6d22h | max | 15:30 EST
+#
+#     claude-usage --no-plan
+#       ⚡ 5h 54% 2h05m | 7d 3% 6d22h
+#
+#     claude-usage --no-7d --no-plan
+#       ⚡ 5h 54% 2h05m
 #
 #   tmux status-right (session manager):
 #     "#(claude-usage --with-time --cache-ttl 15 --timezone-from-config /path/to/config.yaml)"
@@ -153,6 +162,9 @@ CONFIG_FILE=""             # --timezone-from-config <path>
 CACHE_TTL=""               # empty = no caching; seconds between API refreshes if set
 CACHE_DIR="${XDG_RUNTIME_DIR:-${HOME}/.cache}/claude-usage"
 SHOW_TIME=false            # --with-time: append current clock to output
+SHOW_5H=true               # --no-5h: hide 5-hour period
+SHOW_7D=true               # --no-7d: hide 7-day period
+SHOW_PLAN=true             # --no-plan: hide plan type
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -162,6 +174,9 @@ while [[ $# -gt 0 ]]; do
         --timezone-from-config) CONFIG_FILE="$2"; shift 2 ;;
         --cache-ttl)            CACHE_TTL="$2";   shift 2 ;;
         --with-time)            SHOW_TIME=true;    shift ;;
+        --no-5h)               SHOW_5H=false;     shift ;;
+        --no-7d)               SHOW_7D=false;     shift ;;
+        --no-plan)             SHOW_PLAN=false;    shift ;;
         -h|--help)
             sed -n '/^# ── USAGE/,/^# ── DISCOVERY/{ /^# ── DISCOVERY/d; p; }' "$0" | sed 's/^# \{0,3\}//'
             exit 0 ;;
@@ -324,39 +339,57 @@ fetch_cached() {
 
 # ── Fetch live usage ──────────────────────────────────────────────────
 
-usage_json=$(fetch_cached "${API_BASE}/api/oauth/usage" "$CACHE_USAGE")
+if [[ "$SHOW_5H" == "true" || "$SHOW_7D" == "true" ]]; then
+    usage_json=$(fetch_cached "${API_BASE}/api/oauth/usage" "$CACHE_USAGE")
 
-if [[ -n "$usage_json" ]]; then
-    IFS=$'\t' read -r five_pct five_reset seven_pct seven_reset < <(
-        echo "$usage_json" | jq -r '[
-            (.five_hour.utilization  // 0 | tostring),
-            (.five_hour.resets_at    // ""),
-            (.seven_day.utilization  // 0 | tostring),
-            (.seven_day.resets_at    // "")
-        ] | join("\t")')
-else
-    five_pct="?"
-    five_reset=""
-    seven_pct="?"
-    seven_reset=""
+    if [[ -n "$usage_json" ]]; then
+        IFS=$'\t' read -r five_pct five_reset seven_pct seven_reset < <(
+            echo "$usage_json" | jq -r '[
+                (.five_hour.utilization  // 0 | tostring),
+                (.five_hour.resets_at    // ""),
+                (.seven_day.utilization  // 0 | tostring),
+                (.seven_day.resets_at    // "")
+            ] | join("\t")')
+    else
+        five_pct="?"
+        five_reset=""
+        seven_pct="?"
+        seven_reset=""
+    fi
 fi
 
 # ── Fetch plan info ───────────────────────────────────────────────────
 
-profile_json=$(fetch_cached "${API_BASE}/api/oauth/profile" "$CACHE_PROFILE")
+if [[ "$SHOW_PLAN" == "true" ]]; then
+    profile_json=$(fetch_cached "${API_BASE}/api/oauth/profile" "$CACHE_PROFILE")
 
-if [[ -n "$profile_json" ]]; then
-    plan=$(echo "$profile_json" | jq -r '(.organization.organization_type // "unknown") | sub("^claude_"; "")')
-else
-    plan="?"
+    if [[ -n "$profile_json" ]]; then
+        plan=$(echo "$profile_json" | jq -r '(.organization.organization_type // "unknown") | sub("^claude_"; "")')
+    else
+        plan="?"
+    fi
 fi
 
 # ── Output ────────────────────────────────────────────────────────────
 
-five_display=$(fmt_period "5h" "$five_pct" "$five_reset")
-seven_display=$(fmt_period "7d" "$seven_pct" "$seven_reset")
+parts=()
+if [[ "$SHOW_5H" == "true" ]]; then
+    parts+=("$(fmt_period "5h" "$five_pct" "$five_reset")")
+fi
+if [[ "$SHOW_7D" == "true" ]]; then
+    parts+=("$(fmt_period "7d" "$seven_pct" "$seven_reset")")
+fi
+if [[ "$SHOW_PLAN" == "true" ]]; then
+    parts+=("$plan")
+fi
 
-output="⚡ ${five_display} | ${seven_display} | ${plan}"
+output="⚡"
+for i in "${!parts[@]}"; do
+    output+=" ${parts[$i]}"
+    if (( i < ${#parts[@]} - 1 )); then
+        output+=" |"
+    fi
+done
 
 if [[ "$SHOW_TIME" == "true" ]]; then
     if [[ "$CLOCK_FORMAT" == "12h" ]]; then
@@ -364,7 +397,10 @@ if [[ "$SHOW_TIME" == "true" ]]; then
     else
         current_time=$(TZ="$TIMEZONE" date "+%H:%M %Z")
     fi
-    output+=" | ${current_time}"
+    if [[ ${#parts[@]} -gt 0 ]]; then
+        output+=" |"
+    fi
+    output+=" ${current_time}"
 fi
 
 echo "$output"

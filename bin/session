@@ -35,6 +35,8 @@ Usage:
   <session-name> status                      Show session status
   <session-name> restart                     Restart session
   <session-name> restart <subsession>       Restart subsession
+  <session-name> refresh                    Refresh tmux settings (no restart)
+  <session-name> refresh <subsession>      Refresh subsession settings only
 
   session install <config.yaml>      Register project as a command
 
@@ -104,7 +106,7 @@ EOF
 
     echo "Installed '$name' -> $wrapper"
     echo "  Config: $abs_config"
-    echo "  Usage:  $name [subsession] [--headless|status|stop|kill|restart]"
+    echo "  Usage:  $name [subsession] [--headless|status|stop|kill|restart|refresh]"
 }
 
 # Discover all installed session wrappers
@@ -233,7 +235,7 @@ parse_args() {
                 REMOVE_TARGET="${1:-}"
                 return 0
                 ;;
-            stop|kill|status|restart)
+            stop|kill|status|restart|refresh)
                 ACTION="$1"
                 ;;
             *)
@@ -308,7 +310,7 @@ main() {
     tmux source-file "${TOOLS_RUNTIME_DIR}/session-tmux.conf" 2>/dev/null || true
 
     # Handle subsession commands
-    if [[ -n "$SUBSESSION_NAME" && "$ACTION" != "restart" ]]; then
+    if [[ -n "$SUBSESSION_NAME" && "$ACTION" != "restart" && "$ACTION" != "refresh" ]]; then
         case "$ACTION" in
             start)
                 ensure_subsession "$SUBSESSION_NAME"
@@ -321,7 +323,7 @@ main() {
             stop)    stop_subsession "$SUBSESSION_NAME" ;;
             status)  echo "Subsession $SUBSESSION_NAME: $(subsession_status "$SUBSESSION_NAME")" ;;
             kill)    stop_subsession "$SUBSESSION_NAME" ;;
-            *)       die "Unknown action: $ACTION (valid: start, stop, kill, status, restart)" ;;
+            *)       die "Unknown action: $ACTION (valid: start, stop, kill, status, restart, refresh)" ;;
         esac
         return 0
     fi
@@ -329,6 +331,12 @@ main() {
     # Handle restart with optional subsession target
     if [[ "$ACTION" == "restart" && -n "$SUBSESSION_NAME" ]]; then
         restart_subsession "$SUBSESSION_NAME"
+        return 0
+    fi
+
+    # Handle refresh with optional subsession target
+    if [[ "$ACTION" == "refresh" && -n "$SUBSESSION_NAME" ]]; then
+        refresh_subsession "$SUBSESSION_NAME"
         return 0
     fi
 
@@ -349,7 +357,8 @@ main() {
             sleep 2
             start_session
             ;;
-        *)        die "Unknown action: $ACTION (valid: start, stop, kill, status, restart)" ;;
+        refresh)  refresh_session ;;
+        *)        die "Unknown action: $ACTION (valid: start, stop, kill, status, restart, refresh)" ;;
     esac
 }
 
