@@ -34,6 +34,8 @@ cleanup --auto --config my.yaml  # Auto with custom config
 - pnpm store (`~/.pnpm-store`)
 - Orphaned `node_modules` (no parent `package.json`)
 - Accidental `~/node_modules`
+- `.next/` build directories (confirm only, skipped in auto mode)
+- `.open-next/` build directories (confirm only, skipped in auto mode)
 
 ### System
 - systemd journals (vacuums to 100MB)
@@ -45,11 +47,27 @@ cleanup --auto --config my.yaml  # Auto with custom config
 ### Development tools
 - Playwright browser cache
 - Claude CLI cache
+- TypeScript build cache (`~/.cache/typescript/`)
+- Claude CLI Node cache (`~/.cache/claude-cli-nodejs/`)
 - code-server cache and backups
 - Old Claude CLI versions (keeps latest)
 - Duplicate Next.js binaries (wrong arch)
 - Old Volta Node/npm/yarn/pnpm versions
+- Volta inventory tarballs (`~/.volta/tools/inventory/node/*.tar.gz`)
+- Standalone node binaries (`~/.local/share/node-binaries/`, skipped in auto mode)
 - Docker unused resources
+
+### Claude Code sessions
+- Old project session files (`.jsonl` + session dirs, past `session_retention_days`)
+- Debug logs (past `log_retention_days`)
+- File history sessions (all files past `session_retention_days`)
+- Stale todos, tasks, session-env, shell-snapshots
+- **Never touches**: `CLAUDE.md`, `settings.json`, `settings.local.json`, `.credentials.json`, `history.jsonl`, `plugins/`, `cache/`
+
+### Neovim
+- Cache directories (`~/.cache/nvim/`, `~/.cache/nvim-vscode/`)
+- Data backups (`~/.local/share/nvim.backup.*`)
+- Config backups (`~/.config/nvim.backup.*`)
 
 ### Wrangler
 - Log files older than retention period
@@ -81,6 +99,7 @@ All respect `--dry-run` and `--auto` flags.
 # Retention settings
 log_retention_days: 7
 backup_retention_days: 30
+session_retention_days: 14
 
 # Target toggles — set to false to skip
 vscode_enabled: true
@@ -89,6 +108,8 @@ docker_enabled: true
 system_enabled: true
 wrangler_enabled: true
 dev_tools_enabled: true
+claude_enabled: true
+neovim_enabled: true
 ```
 
 ## Dry-run mode
@@ -109,6 +130,10 @@ Skip all confirmation prompts. Safe targets are cleaned automatically:
 cleanup --auto
 ```
 
+Some targets are **skipped in auto mode** to protect dev velocity:
+- `.next/` and `.open-next/` build directories
+- Standalone node binaries (`~/.local/share/node-binaries/`)
+
 ## Architecture
 
 The cleanup utility is split into focused modules under `lib/cleanup/`:
@@ -118,9 +143,10 @@ The cleanup utility is split into focused modules under `lib/cleanup/`:
 | `common.sh` | Helpers, `safe_rm()`, dry-run/auto logic |
 | `config.sh` | YAML config loading, target toggles |
 | `vscode.sh` | VS Code Server cleanup |
-| `nodejs.sh` | NPM/pnpm, orphaned node_modules |
+| `nodejs.sh` | NPM/pnpm, orphaned node_modules, build artifacts |
 | `system.sh` | Journals, APT, pip, temp files, logs |
-| `dev-tools.sh` | Docker, Wrangler, Volta, Playwright, etc. |
+| `claude.sh` | Claude Code sessions, debug logs, file history |
+| `dev-tools.sh` | Docker, Wrangler, Volta, Playwright, Neovim, etc. |
 | `updates.sh` | apt/snap/flatpak/npm global updates |
 
 `bin/cleanup` sources all modules and orchestrates based on config.

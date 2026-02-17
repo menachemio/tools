@@ -4,6 +4,7 @@
 # Retention settings
 log_retention_days: 7
 backup_retention_days: 30
+session_retention_days: 14
 
 # Target toggles — set to false to skip
 vscode_enabled: true
@@ -12,3 +13,5 @@ docker_enabled: true
 system_enabled: true
 wrangler_enabled: true
 dev_tools_enabled: true
+claude_enabled: true
+neovim_enabled: true

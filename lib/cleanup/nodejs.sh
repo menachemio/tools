@@ -35,6 +35,62 @@ clean_npm_cache() {
     fi
 }
 
+clean_build_artifacts() {
+    log_info "Checking for Next.js build artifacts..."
+
+    # Skip in auto mode — build caches hurt dev velocity if removed unexpectedly
+    if [[ "$AUTO_MODE" == "true" ]]; then
+        log_info "Skipping build artifacts in auto mode"
+        return 0
+    fi
+
+    # .next/ directories
+    local next_dirs
+    next_dirs=$(find "$HOME" -maxdepth 4 -type d -name ".next" -not -path "*/node_modules/*" 2>/dev/null || true)
+    if [[ -n "$next_dirs" ]]; then
+        local count
+        count=$(echo "$next_dirs" | wc -l)
+        log_info "Found $count .next/ build directories"
+        while IFS= read -r d; do
+            local SIZE
+            SIZE=$(get_size "$d")
+            echo "  $SIZE - $d"
+        done <<< "$next_dirs"
+
+        if confirm_action "Remove .next/ build directories?"; then
+            while IFS= read -r d; do
+                safe_rm "$d" ".next build: $d"
+            done <<< "$next_dirs"
+            log_success "Removed .next/ build directories"
+        fi
+    fi
+
+    # .open-next/ directories
+    local open_next_dirs
+    open_next_dirs=$(find "$HOME" -maxdepth 4 -type d -name ".open-next" -not -path "*/node_modules/*" 2>/dev/null || true)
+    if [[ -n "$open_next_dirs" ]]; then
+        local count
+        count=$(echo "$open_next_dirs" | wc -l)
+        log_info "Found $count .open-next/ build directories"
+        while IFS= read -r d; do
+            local SIZE
+            SIZE=$(get_size "$d")
+            echo "  $SIZE - $d"
+        done <<< "$open_next_dirs"
+
+        if confirm_action "Remove .open-next/ build directories?"; then
+            while IFS= read -r d; do
+                safe_rm "$d" ".open-next build: $d"
+            done <<< "$open_next_dirs"
+            log_success "Removed .open-next/ build directories"
+        fi
+    fi
+
+    if [[ -z "$next_dirs" && -z "$open_next_dirs" ]]; then
+        log_info "No Next.js build artifacts found"
+    fi
+}
+
 clean_orphaned_node_modules() {
     log_info "Checking for orphaned node_modules directories..."
 

@@ -8,6 +8,7 @@ source "$CLEANUP_LIB_DIR/../common/yaml-parser.sh"
 # Defaults (overridden by YAML config)
 declare -g CLEANUP_LOG_RETENTION_DAYS=7
 declare -g CLEANUP_BACKUP_RETENTION_DAYS=30
+declare -g CLEANUP_SESSION_RETENTION_DAYS=14
 declare -g -a CLEANUP_PROTECTED_DIRS=()
 declare -g -a CLEANUP_PROTECTED_PATTERNS=()
 declare -g -A CLEANUP_TARGETS=()
@@ -36,8 +37,11 @@ load_cleanup_config() {
     val=$(yaml_get "backup_retention_days")
     [[ -n "$val" ]] && CLEANUP_BACKUP_RETENTION_DAYS="$val"
 
-    # Target toggles (vscode, nodejs, docker, system, wrangler, dev_tools)
-    for target in vscode nodejs docker system wrangler dev_tools; do
+    val=$(yaml_get "session_retention_days")
+    [[ -n "$val" ]] && CLEANUP_SESSION_RETENTION_DAYS="$val"
+
+    # Target toggles (vscode, nodejs, docker, system, wrangler, dev_tools, claude, neovim)
+    for target in vscode nodejs docker system wrangler dev_tools claude neovim; do
         val=$(yaml_get "${target}_enabled")
         if [[ -n "$val" ]]; then
             CLEANUP_TARGETS["$target"]="$val"
@@ -58,7 +62,7 @@ target_enabled() {
 
 # Initialize defaults (no config file).
 init_cleanup_defaults() {
-    for target in vscode nodejs docker system wrangler dev_tools; do
+    for target in vscode nodejs docker system wrangler dev_tools claude neovim; do
         CLEANUP_TARGETS["$target"]="true"
     done
 }

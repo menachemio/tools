@@ -15,6 +15,7 @@ source "$LIB_DIR/vscode.sh"
 source "$LIB_DIR/nodejs.sh"
 source "$LIB_DIR/system.sh"
 source "$LIB_DIR/dev-tools.sh"
+source "$LIB_DIR/claude.sh"
 source "$LIB_DIR/updates.sh"
 
 # CLI flags
@@ -120,6 +121,8 @@ main() {
         echo
         clean_orphaned_node_modules
         echo
+        clean_build_artifacts
+        echo
     fi
 
     if target_enabled "wrangler"; then
@@ -130,10 +133,22 @@ main() {
     if target_enabled "dev_tools"; then
         clean_dev_tools
         echo
+        clean_standalone_binaries
+        echo
     fi
 
     if target_enabled "docker"; then
         clean_docker
+        echo
+    fi
+
+    if target_enabled "claude"; then
+        clean_claude_sessions
+        echo
+    fi
+
+    if target_enabled "neovim"; then
+        clean_neovim_caches
         echo
     fi
 
