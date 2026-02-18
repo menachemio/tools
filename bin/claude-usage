@@ -343,13 +343,13 @@ if [[ "$SHOW_5H" == "true" || "$SHOW_7D" == "true" ]]; then
     usage_json=$(fetch_cached "${API_BASE}/api/oauth/usage" "$CACHE_USAGE")
 
     if [[ -n "$usage_json" ]]; then
-        IFS=$'\t' read -r five_pct five_reset seven_pct seven_reset < <(
+        IFS='|' read -r five_pct five_reset seven_pct seven_reset < <(
             echo "$usage_json" | jq -r '[
                 (.five_hour.utilization  // 0 | tostring),
                 (.five_hour.resets_at    // ""),
                 (.seven_day.utilization  // 0 | tostring),
                 (.seven_day.resets_at    // "")
-            ] | join("\t")')
+            ] | join("|")')
     else
         five_pct="?"
         five_reset=""
