@@ -317,7 +317,7 @@ main() {
                 if [[ "$HEADLESS_MODE" == true ]]; then
                     log "Subsession '$SUBSESSION_NAME' started in background"
                 else
-                    exec tmux attach-session -t "$SUBSESSION_NAME"
+                    TMUX= exec tmux attach-session -t "$SUBSESSION_NAME"
                 fi
                 ;;
             stop)    stop_subsession "$SUBSESSION_NAME" ;;

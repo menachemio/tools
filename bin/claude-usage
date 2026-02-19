@@ -383,7 +383,7 @@ if [[ "$SHOW_PLAN" == "true" ]]; then
     parts+=("$plan")
 fi
 
-output="⚡"
+output="»"
 for i in "${!parts[@]}"; do
     output+=" ${parts[$i]}"
     if (( i < ${#parts[@]} - 1 )); then
