@@ -279,8 +279,8 @@ fmt_reset() {
     fi
 }
 
-# Format a single rate-limit period: "<label> <pct>% <reset>"
-# e.g. "5h 54% 2h05m" or "7d 3% 6d22h"
+# Format a single rate-limit period: "[label] <pct>% <reset>"
+# e.g. "[5h] 54% 2h05m" or "[7d] 3% 6d22h"
 fmt_period() {
     local label="$1" pct="$2" reset_ts="$3"
     local reset_display
@@ -289,7 +289,7 @@ fmt_period() {
     # Strip trailing .0 from percentage (54.0 → 54)
     pct="${pct%%.0}"
 
-    local out="${label} ${pct}%"
+    local out="[${label}] ${pct}%"
     if [[ -n "$reset_display" ]]; then
         out+=" ${reset_display}"
     fi
