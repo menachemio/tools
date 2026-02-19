@@ -460,6 +460,13 @@ setup_pane() {
                 return
             fi
 
+            # Per-pane dir override (absolute or relative to config dir)
+            local pane_dir=$(yaml_get_pane "$window_name" "$pane_index" "dir")
+            if [[ -n "$pane_dir" ]]; then
+                pane_dir=$(resolve_dir "$pane_dir")
+                tmux send-keys -t "$pane_target" "${HIST_SKIP}cd '${pane_dir}'" Enter 2>/dev/null || true
+            fi
+
             local cmd=$(yaml_get_pane "$window_name" "$pane_index" "cmd")
             local execute=$(yaml_get_pane "$window_name" "$pane_index" "execute")
             local history=$(yaml_get_pane "$window_name" "$pane_index" "history")
