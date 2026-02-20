@@ -147,7 +147,7 @@ cmd_remove() {
     local target="$1"
     while IFS=$'\t' read -r name wrapper config; do
         if [[ "$name" == "$target" ]]; then
-            if tmux has-session -t "$name" 2>/dev/null; then
+            if _tmux has-session -t "$name" 2>/dev/null; then
                 echo "Warning: session '$name' is currently running" >&2
             fi
             rm "$wrapper"
@@ -307,7 +307,7 @@ main() {
     # Generate tmux config and source once (covers all code paths)
     TIMEZONE_SCRIPT=$(create_timezone_script)
     create_tmux_config "$TIMEZONE_SCRIPT"
-    tmux source-file "${TOOLS_RUNTIME_DIR}/session-tmux.conf" 2>/dev/null || true
+    _tmux source-file "${TOOLS_RUNTIME_DIR}/session-tmux.conf" 2>/dev/null || true
 
     # Handle subsession commands
     if [[ -n "$SUBSESSION_NAME" && "$ACTION" != "restart" && "$ACTION" != "refresh" ]]; then
@@ -317,7 +317,7 @@ main() {
                 if [[ "$HEADLESS_MODE" == true ]]; then
                     log "Subsession '$SUBSESSION_NAME' started in background"
                 else
-                    TMUX= exec tmux attach-session -t "$SUBSESSION_NAME"
+                    TMUX= exec tmux -L "$SM_SOCKET" attach-session -t "$SUBSESSION_NAME"
                 fi
                 ;;
             stop)    stop_subsession "$SUBSESSION_NAME" ;;

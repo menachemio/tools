@@ -5,7 +5,7 @@
 
 # Check if a subsession exists and is running
 subsession_exists() {
-    tmux has-session -t "$1" 2>/dev/null
+    _tmux has-session -t "$1" 2>/dev/null
 }
 
 # Start a new subsession
@@ -30,13 +30,13 @@ start_subsession() {
     local tmux_conf="${TOOLS_RUNTIME_DIR}/session-tmux.conf"
     local tmux_new_flags=()
     [[ -f "$tmux_conf" ]] && tmux_new_flags+=(-f "$tmux_conf")
-    if ! tmux "${tmux_new_flags[@]}" new-session -d -s "$name" -c "$dir" 2>/dev/null; then
+    if ! _tmux "${tmux_new_flags[@]}" new-session -d -s "$name" -c "$dir" 2>/dev/null; then
         log "Failed to create subsession $name"
         return 1
     fi
 
     # Subsession baseline defaults (before color/tmux overrides)
-    tmux set-option -t "$name" status-justify left 2>/dev/null || true
+    _tmux set-option -t "$name" status-justify left 2>/dev/null || true
 
     # Build export prefix from environment variables if provided
     local export_prefix=""
@@ -68,17 +68,17 @@ start_subsession() {
             if [[ "$execute" == "false" ]]; then
                 # Pre-fill command text without executing (env vars still exported first)
                 if [[ -n "$export_prefix" ]]; then
-                    tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix%%; }" Enter 2>/dev/null || true
+                    _tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix%%; }" Enter 2>/dev/null || true
                 fi
-                tmux send-keys -t "$name" "$command" 2>/dev/null || true
+                _tmux send-keys -t "$name" "$command" 2>/dev/null || true
             else
-                tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix}${command}" Enter 2>/dev/null || true
+                _tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix}${command}" Enter 2>/dev/null || true
                 if [[ "$history" == "true" ]]; then
                     echo "$command" >> ~/.bash_history
                 fi
             fi
         elif [[ -n "$export_prefix" ]]; then
-            tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix%%; }" Enter 2>/dev/null || true
+            _tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix%%; }" Enter 2>/dev/null || true
         fi
     }
 
@@ -104,9 +104,9 @@ attach_pane_to_subsession() {
     fi
 
     if [[ -n "$cmd" ]]; then
-        tmux send-keys -t "$subsession" "${HIST_SKIP}$cmd" Enter 2>/dev/null || true
+        _tmux send-keys -t "$subsession" "${HIST_SKIP}$cmd" Enter 2>/dev/null || true
     fi
-    tmux send-keys -t "$pane" "${HIST_SKIP}TMUX= tmux attach-session -t $subsession || exec bash" Enter 2>/dev/null || return 1
+    _tmux send-keys -t "$pane" "${HIST_SKIP}TMUX= tmux -L '${SM_SOCKET}' attach-session -t '${subsession}' || exec bash" Enter 2>/dev/null || return 1
     return 0
 }
 
@@ -119,7 +119,7 @@ stop_subsession() {
         return 0
     fi
 
-    tmux kill-session -t "$name" 2>/dev/null || true
+    _tmux kill-session -t "$name" 2>/dev/null || true
     log "Stopped subsession: $name"
     return 0
 }

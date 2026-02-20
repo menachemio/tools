@@ -3,8 +3,6 @@
 
 # Source dependencies
 CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$CORE_DIR/../common/yaml-parser.sh"
-source "$CORE_DIR/subsession-manager.sh"
 
 # Global configuration
 CONFIG_FILE=""
@@ -23,6 +21,15 @@ HIST_SKIP=" "
 TOOLS_RUNTIME_DIR="${XDG_RUNTIME_DIR:-${HOME}/.cache/tools}/session"
 mkdir -p "$TOOLS_RUNTIME_DIR" 2>/dev/null || true
 
+# Dedicated tmux socket -- isolates session-manager onto its own server.
+# All tmux commands route through _tmux() so ~/.tmux.conf never leaks in.
+SM_SOCKET="session-mgr"
+_tmux() { command tmux -L "$SM_SOCKET" "$@"; }
+
+# Source modules (after _tmux is defined -- modules reference it)
+source "$CORE_DIR/../common/yaml-parser.sh"
+source "$CORE_DIR/subsession-manager.sh"
+
 # Logging functions
 log() { [[ "$VERBOSE" == "true" ]] && echo ":: $*" >&2 || true; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -34,7 +41,7 @@ wait_for_target() {
     local max_attempts="${2:-50}"  # 50 x 100ms = 5s max
     local i=0
     while [[ $i -lt $max_attempts ]]; do
-        tmux display-message -t "$target" -p "#{pane_id}" &>/dev/null && return 0
+        _tmux display-message -t "$target" -p "#{pane_id}" &>/dev/null && return 0
         sleep 0.1
         ((i++)) || true
     done
@@ -171,7 +178,8 @@ EOF
 }
 
 # Create tmux configuration
-# This is the authoritative config -- loaded via -f, bypassing ~/.tmux.conf
+# Authoritative config loaded via -f on the dedicated socket (SM_SOCKET).
+# The -L socket isolates session-manager; -f seeds config on first server start.
 # Options under tmux.global in YAML override these defaults.
 create_tmux_config() {
     local timezone_script="$1"
@@ -205,7 +213,7 @@ create_tmux_config() {
 
     cat > "$conf" << EOF
 # Session Manager tmux configuration (authoritative)
-# Loaded via -f on server start -- ~/.tmux.conf is bypassed
+# Loaded via -f on the dedicated socket -- ~/.tmux.conf is never seen
 # Options can be overridden via the tmux.global section in session YAML
 
 # Prefix key
@@ -321,7 +329,7 @@ _apply_tmux_opts() {
     for key in "${!YAML_VALUES[@]}"; do
         if [[ "$key" == ${prefix}* ]]; then
             local opt="${key#${prefix}}"
-            tmux "$tmux_cmd" -t "$target" "$opt" "${YAML_VALUES[$key]}" 2>/dev/null || \
+            _tmux "$tmux_cmd" -t "$target" "$opt" "${YAML_VALUES[$key]}" 2>/dev/null || \
                 log "Failed to set option ($target): $opt"
         fi
     done
@@ -339,7 +347,7 @@ apply_tmux_window_options() {
 
 # Exclude session from tmux-resurrect if available (per-session option)
 exclude_from_resurrect() {
-    tmux set-option -t "$1" @resurrect-exclude 1 2>/dev/null || true
+    _tmux set-option -t "$1" @resurrect-exclude 1 2>/dev/null || true
 }
 
 # Apply session color scheme.
@@ -352,13 +360,13 @@ _apply_color_defaults() {
     [[ -z "$color" ]] && return
 
     if [[ -z "$ov_style" ]]; then
-        tmux set-option -t "$target" status-style "fg=${color},bg=default" 2>/dev/null || true
+        _tmux set-option -t "$target" status-style "fg=${color},bg=default" 2>/dev/null || true
     fi
     if [[ -z "$ov_left" ]]; then
-        tmux set-option -t "$target" status-left "#[fg=${color},bold] #S #[default]" 2>/dev/null || true
+        _tmux set-option -t "$target" status-left "#[fg=${color},bold] #S #[default]" 2>/dev/null || true
     fi
     if [[ -n "$timezone_script" && -z "$ov_right" ]]; then
-        tmux set-option -t "$target" status-right "#[fg=${color}] #($timezone_script) #[default]" 2>/dev/null || true
+        _tmux set-option -t "$target" status-right "#[fg=${color}] #($timezone_script) #[default]" 2>/dev/null || true
     fi
 }
 
@@ -380,7 +388,7 @@ apply_session_colors() {
         "$(yaml_get_tmux_session "status-right")"
 
     if [[ -z "$(yaml_get_tmux_session "status-justify")" ]]; then
-        tmux set-option -t "$session_name" status-justify centre 2>/dev/null || true
+        _tmux set-option -t "$session_name" status-justify centre 2>/dev/null || true
     fi
 
     log "Applied session color: $session_color"
@@ -395,40 +403,40 @@ create_pane_layout() {
     log "Creating $pane_count panes for $target"
 
     # Check window dimensions
-    local width=$(tmux display-message -t "$target" -p "#{window_width}")
-    local height=$(tmux display-message -t "$target" -p "#{window_height}")
+    local width=$(_tmux display-message -t "$target" -p "#{window_width}")
+    local height=$(_tmux display-message -t "$target" -p "#{window_height}")
     if [[ $width -lt 20 || $height -lt 10 ]]; then
-        tmux resize-window -t "$target" -x 80 -y 24 2>/dev/null || true
-        width=$(tmux display-message -t "$target" -p "#{window_width}")
-        height=$(tmux display-message -t "$target" -p "#{window_height}")
+        _tmux resize-window -t "$target" -x 80 -y 24 2>/dev/null || true
+        width=$(_tmux display-message -t "$target" -p "#{window_width}")
+        height=$(_tmux display-message -t "$target" -p "#{window_height}")
         log "Post-resize dimensions: ${width}x${height}"
     fi
 
     case $pane_count in
         1) return 0 ;;
         2)
-            tmux split-window -h -t "$target" -c "$working_dir" 2>/dev/null || true
+            _tmux split-window -h -t "$target" -c "$working_dir" 2>/dev/null || true
             ;;
         3)
-            tmux split-window -h -t "$target" -c "$working_dir" 2>/dev/null || true
-            tmux split-window -v -t "${target}.2" -c "$working_dir" 2>/dev/null || true
+            _tmux split-window -h -t "$target" -c "$working_dir" 2>/dev/null || true
+            _tmux split-window -v -t "${target}.2" -c "$working_dir" 2>/dev/null || true
             ;;
         4)
-            tmux split-window -v -t "$target" -c "$working_dir" 2>/dev/null || true
-            tmux split-window -h -t "${target}.1" -c "$working_dir" 2>/dev/null || true
-            tmux split-window -h -t "${target}.3" -c "$working_dir" 2>/dev/null || true
-            tmux select-layout -t "$target" tiled 2>/dev/null || true
+            _tmux split-window -v -t "$target" -c "$working_dir" 2>/dev/null || true
+            _tmux split-window -h -t "${target}.1" -c "$working_dir" 2>/dev/null || true
+            _tmux split-window -h -t "${target}.3" -c "$working_dir" 2>/dev/null || true
+            _tmux select-layout -t "$target" tiled 2>/dev/null || true
             ;;
         *)
             for ((i=1; i<pane_count; i++)); do
-                tmux split-window -v -t "$target" -c "$working_dir" 2>/dev/null || break
+                _tmux split-window -v -t "$target" -c "$working_dir" 2>/dev/null || break
             done
-            tmux select-layout -t "$target" tiled 2>/dev/null || true
+            _tmux select-layout -t "$target" tiled 2>/dev/null || true
             ;;
     esac
 
     wait_for_target "$target" || true
-    local actual=$(tmux list-panes -t "$target" | wc -l)
+    local actual=$(_tmux list-panes -t "$target" | wc -l)
     log "Window $target: requested $pane_count, created $actual panes"
     if [[ $actual -lt $pane_count ]]; then
         echo "WARNING: Window $target: only $actual of $pane_count panes created (split-window may have failed)" >&2
@@ -455,7 +463,7 @@ setup_pane() {
             fi
             ;;
         "command")
-            if ! tmux display-message -t "$pane_target" -p "#{pane_id}" &>/dev/null; then
+            if ! _tmux display-message -t "$pane_target" -p "#{pane_id}" &>/dev/null; then
                 log "Pane $pane_target does not exist, skipping command setup"
                 return
             fi
@@ -464,7 +472,7 @@ setup_pane() {
             local pane_dir=$(yaml_get_pane "$window_name" "$pane_index" "dir")
             if [[ -n "$pane_dir" ]]; then
                 pane_dir=$(resolve_dir "$pane_dir")
-                tmux send-keys -t "$pane_target" "${HIST_SKIP}cd '${pane_dir}'" Enter 2>/dev/null || true
+                _tmux send-keys -t "$pane_target" "${HIST_SKIP}cd '${pane_dir}'" Enter 2>/dev/null || true
             fi
 
             local cmd=$(yaml_get_pane "$window_name" "$pane_index" "cmd")
@@ -473,7 +481,7 @@ setup_pane() {
 
             if [[ -n "$cmd" ]]; then
                 if [[ "$execute" == "true" ]]; then
-                    tmux send-keys -t "$pane_target" "${HIST_SKIP}$cmd" Enter 2>/dev/null || true
+                    _tmux send-keys -t "$pane_target" "${HIST_SKIP}$cmd" Enter 2>/dev/null || true
 
                     # Optionally add to history
                     if [[ "$history" == "true" ]]; then
@@ -481,7 +489,7 @@ setup_pane() {
                     fi
                 else
                     # Pre-fill command text, don't execute (wait for Enter)
-                    tmux send-keys -t "$pane_target" "$cmd" 2>/dev/null || true
+                    _tmux send-keys -t "$pane_target" "$cmd" 2>/dev/null || true
                 fi
             fi
             ;;
@@ -506,16 +514,16 @@ create_window() {
     # Create or rename window
     # First window inherits cwd from new-session -c; subsequent windows use new-window -c
     if [[ "$is_first_window" == "true" ]]; then
-        tmux rename-window -t "$session_name" "$window_name" 2>/dev/null || true
+        _tmux rename-window -t "$session_name" "$window_name" 2>/dev/null || true
     else
-        tmux new-window -t "$session_name" -n "$window_name" -c "$window_dir" || \
+        _tmux new-window -t "$session_name" -n "$window_name" -c "$window_dir" || \
             { log "Failed to create window: $window_name"; return; }
     fi
 
     # Apply window colors from the legacy `color:` key
     if [[ -n "$window_color" ]]; then
-        tmux set-window-option -t "$session_name:$window_name" window-status-current-style "fg=white,bg=$window_color,bold" 2>/dev/null || true
-        tmux set-window-option -t "$session_name:$window_name" window-status-style "fg=$window_color,bg=default" 2>/dev/null || true
+        _tmux set-window-option -t "$session_name:$window_name" window-status-current-style "fg=white,bg=$window_color,bold" 2>/dev/null || true
+        _tmux set-window-option -t "$session_name:$window_name" window-status-style "fg=$window_color,bg=default" 2>/dev/null || true
     fi
 
     # Apply per-window tmux options from YAML (overrides color: convenience styling)
@@ -588,11 +596,11 @@ start_session() {
     done
 
     # If session exists, just attach
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         log "Session $SESSION_NAME already exists"
-        tmux set-option -u window-size 2>/dev/null || true
+        _tmux set-option -u window-size 2>/dev/null || true
         if [[ "$headless_mode" != "--headless" ]]; then
-            exec tmux attach-session -t "$SESSION_NAME"
+            exec tmux -L "$SM_SOCKET" attach-session -t "$SESSION_NAME"
         else
             log "Session running in background"
         fi
@@ -600,7 +608,7 @@ start_session() {
     fi
 
     log "Creating new session: $SESSION_NAME"
-    tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+    _tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 
     # Resolve first window dir so new-session starts with the right cwd natively
     local first_win_dir
@@ -608,11 +616,11 @@ start_session() {
     [[ -z "$first_win_dir" ]] && first_win_dir="."
     first_win_dir=$(resolve_dir "$first_win_dir")
 
-    # Create main session (-f bypasses ~/.tmux.conf on fresh server start)
-    # bin/session already sourced config for existing servers; -f handles new servers
-    tmux -f "${TOOLS_RUNTIME_DIR}/session-tmux.conf" new-session -d -s "$SESSION_NAME" -c "$first_win_dir" || \
+    # Create main session on the dedicated socket (-L $SM_SOCKET).
+    # -f loads our config on first server start; the socket guarantees isolation.
+    _tmux -f "${TOOLS_RUNTIME_DIR}/session-tmux.conf" new-session -d -s "$SESSION_NAME" -c "$first_win_dir" || \
         die "Failed to create tmux session: $SESSION_NAME"
-    tmux set-option -u window-size 2>/dev/null || true
+    _tmux set-option -u window-size 2>/dev/null || true
     exclude_from_resurrect "$SESSION_NAME"
     apply_session_colors "$SESSION_NAME" "$TIMEZONE_SCRIPT"
 
@@ -653,22 +661,22 @@ start_session() {
     done < <(yaml_get_windows)
 
     # Focus first window
-    tmux select-window -t "$SESSION_NAME:1" 2>/dev/null || true
-    tmux select-pane -t "$SESSION_NAME:1.1" 2>/dev/null || true
+    _tmux select-window -t "$SESSION_NAME:1" 2>/dev/null || true
+    _tmux select-pane -t "$SESSION_NAME:1.1" 2>/dev/null || true
 
     if [[ "$headless_mode" == "--headless" ]]; then
         log "Session ready and running in background"
     else
         log "Attaching to session..."
-        exec tmux attach-session -t "$SESSION_NAME"
+        exec tmux -L "$SM_SOCKET" attach-session -t "$SESSION_NAME"
     fi
 }
 
 # Stop session (keep subsessions)
 stop_session() {
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         log "Stopping main session: $SESSION_NAME"
-        tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+        _tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 
         # Report remaining subsessions
         while IFS= read -r sub_name; do
@@ -686,10 +694,10 @@ stop_session() {
 
 # Show session status
 show_session_status() {
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         echo "Main session: $SESSION_NAME (running)"
         local windows
-        windows=$(tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null | tr '\n' ' ')
+        windows=$(_tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null | tr '\n' ' ')
         echo "  Windows: $windows"
     else
         echo "Main session: $SESSION_NAME (not running)"
@@ -708,7 +716,7 @@ show_session_status() {
 
 # Refresh tmux settings for running session without restarting processes
 refresh_session() {
-    if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if ! _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         die "Session '$SESSION_NAME' is not running"
     fi
 
@@ -717,14 +725,14 @@ refresh_session() {
     # Regenerate timezone script and tmux config, then re-source
     TIMEZONE_SCRIPT=$(create_timezone_script)
     create_tmux_config "$TIMEZONE_SCRIPT"
-    tmux source-file "${TOOLS_RUNTIME_DIR}/session-tmux.conf" 2>/dev/null || true
+    _tmux source-file "${TOOLS_RUNTIME_DIR}/session-tmux.conf" 2>/dev/null || true
 
     # Re-apply session-level colors and options
     apply_session_colors "$SESSION_NAME" "$TIMEZONE_SCRIPT"
 
     # Re-apply per-window styling
     local running_windows
-    running_windows=$(tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null) || running_windows=""
+    running_windows=$(_tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null) || running_windows=""
     while IFS= read -r window_name; do
         [[ -z "$window_name" ]] && continue
 
@@ -738,8 +746,8 @@ refresh_session() {
         local window_color
         window_color=$(yaml_get_window "$window_name" "color")
         if [[ -n "$window_color" ]]; then
-            tmux set-window-option -t "$SESSION_NAME:$window_name" window-status-current-style "fg=white,bg=$window_color,bold" 2>/dev/null || true
-            tmux set-window-option -t "$SESSION_NAME:$window_name" window-status-style "fg=$window_color,bg=default" 2>/dev/null || true
+            _tmux set-window-option -t "$SESSION_NAME:$window_name" window-status-current-style "fg=white,bg=$window_color,bold" 2>/dev/null || true
+            _tmux set-window-option -t "$SESSION_NAME:$window_name" window-status-style "fg=$window_color,bg=default" 2>/dev/null || true
         fi
 
         # Re-apply per-window tmux options
@@ -766,7 +774,7 @@ refresh_session() {
 kill_all_sessions() {
     local sessions=()
 
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         sessions+=("$SESSION_NAME (main)")
     fi
 
@@ -798,14 +806,14 @@ kill_all_sessions() {
         [[ -z "$sub_name" ]] && continue
         if subsession_exists "$sub_name"; then
             log "Killing subsession: $sub_name"
-            tmux kill-session -t "$sub_name" 2>/dev/null || true
+            _tmux kill-session -t "$sub_name" 2>/dev/null || true
         fi
     done < <(yaml_get_subsessions)
 
     # Kill main session
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         log "Killing main session: $SESSION_NAME"
-        tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+        _tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
     fi
 
     log "All sessions terminated"
