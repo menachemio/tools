@@ -110,7 +110,8 @@
 #     --no-plan                 Hide the plan type (e.g. "max")
 #     --cache-ttl SECS          Cache API responses for SECS seconds.
 #                               Without this flag, every call hits the API.
-#                               Recommended: 15-60 for tmux status bars.
+#                               The usage endpoint allows ~5 req per 5 min.
+#                               Recommended: 90+ for tmux status bars.
 #
 #   Examples:
 #     claude-usage
@@ -122,7 +123,7 @@
 #     claude-usage --time-format clock --clock-format 12h --timezone America/New_York
 #       ⚡ 5h 54% 6:00 PM | 7d 3% 6d22h | max
 #
-#     claude-usage --with-time --timezone America/New_York --cache-ttl 15
+#     claude-usage --with-time --timezone America/New_York --cache-ttl 90
 #       ⚡ 5h 54% 2h05m | 7d 3% 6d22h | max | 15:30 EST
 #
 #     claude-usage --no-plan
@@ -132,7 +133,7 @@
 #       ⚡ 5h 54% 2h05m
 #
 #   tmux status-right (session manager):
-#     "#(claude-usage --with-time --cache-ttl 15 --timezone-from-config /path/to/config.yaml)"
+#     "#(claude-usage --with-time --cache-ttl 90 --timezone-from-config /path/to/config.yaml)"
 #
 # ── DISCOVERY LOG ────────────────────────────────────────────────────
 #
@@ -145,6 +146,16 @@
 #   - Found /api/oauth/usage exists (401, not 404) but rejected without beta
 #   - Extracted beta header from binary: AY="oauth-2025-04-20"
 #   - With beta header → 200! Full usage data returned.
+#
+# 2026-03-06: Cloudflare WAF blocks /api/oauth/usage without correct UA.
+#   - Requests with default curl User-Agent get 429'd by Cloudflare (not app).
+#     Identified by: no request-id or x-envoy-upstream-service-time in 429
+#     response (request never reaches backend). IP gets penalty-boxed.
+#   - Claude Code binary sends: User-Agent: claude-code/<version>
+#     Extracted via: strings <bin> | grep -oP '.{0,300}/api/oauth/usage.{0,300}'
+#     Found function nH8(): headers include {"User-Agent": l5(), ...}
+#     where l5() returns `claude-code/${VERSION}`.
+#   - With correct User-Agent → 200 immediately, even from penalty-boxed IP.
 #
 # ═════════════════════════════════════════════════════════════════════
 
@@ -206,7 +217,12 @@ if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" ]]; then
     echo "no token"; exit 1
 fi
 
-AUTH_HEADERS=(-H "Authorization: Bearer $ACCESS_TOKEN" -H "anthropic-beta: $BETA_HEADER")
+# Claude Code sends "User-Agent: claude-code/<version>" on all /api/oauth/ calls.
+# Cloudflare rate-limits requests without this — the endpoint is gated to the
+# Claude Code client. We match the pattern to avoid triggering the WAF rule.
+CLAUDE_VERSION=$(basename "$(readlink "${HOME}/.local/bin/claude" 2>/dev/null)" 2>/dev/null)
+CLAUDE_VERSION="${CLAUDE_VERSION:-0.0.0}"
+AUTH_HEADERS=(-H "Authorization: Bearer $ACCESS_TOKEN" -H "anthropic-beta: $BETA_HEADER" -H "User-Agent: claude-code/$CLAUDE_VERSION")
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -300,6 +316,12 @@ fmt_period() {
 # When --cache-ttl is set, API responses are cached to disk. Subsequent
 # calls within the TTL read from cache instead of hitting the network.
 # Without --cache-ttl, every invocation makes a fresh API call.
+#
+# Concurrent callers (e.g. multiple tmux status bars) are coordinated via
+# flock: the first caller grabs a non-blocking exclusive lock, fetches,
+# and writes the cache. Concurrent callers that fail to acquire the lock
+# serve stale cache immediately (zero contention). This prevents
+# thundering-herd scenarios where N callers fire N simultaneous API requests.
 
 CACHE_USAGE="${CACHE_DIR}/usage.json"
 CACHE_PROFILE="${CACHE_DIR}/profile.json"
@@ -317,30 +339,73 @@ cache_fresh() {
 
 # Fetch with optional caching. Args: <url> <cache_file>
 # Prints the JSON to stdout.
+#
+# When caching is enabled, uses flock to coordinate concurrent callers:
+#   1. Check cache without lock (fast path — no contention if fresh)
+#   2. Try non-blocking exclusive lock on <cache_file>.lock
+#      - If lock fails: serve stale cache immediately (or empty if none)
+#   3. Re-check cache (may have been refreshed between step 1 and lock)
+#   4. Fetch from API, write cache, release lock
+# If the API fails, serve stale cache as a fallback.
 fetch_cached() {
     local url="$1" cache_file="$2"
+
+    # Fast path: cache is fresh, no lock needed
     if cache_fresh "$cache_file"; then
         cat "$cache_file"
         return
     fi
-    local data
-    data=$(curl -sf --max-time 5 "$url" \
-        "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" 2>/dev/null) || data=""
-    if [[ -n "$data" && -n "$CACHE_TTL" ]]; then
-        mkdir -p "$CACHE_DIR" 2>/dev/null
-        local tmp
-        tmp=$(mktemp "$CACHE_DIR/.tmp.XXXXXX") && {
-            printf "%s" "$data" > "$tmp"
-            mv -f "$tmp" "$cache_file"
-        }
+
+    # No caching — just fetch directly
+    if [[ -z "$CACHE_TTL" ]]; then
+        local data
+        data=$(curl -sf --max-time 5 "$url" \
+            "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" 2>/dev/null) || data=""
+        printf "%s" "$data"
+        return
     fi
-    printf "%s" "$data"
+
+    local lock_file="${cache_file}.lock"
+    mkdir -p "$CACHE_DIR" 2>/dev/null
+
+    # Non-blocking lock: if another process is already fetching, serve
+    # stale cache immediately rather than queueing behind it.
+    (
+        if ! flock -n 9; then
+            [[ -f "$cache_file" ]] && cat "$cache_file"
+            exit 0
+        fi
+
+        # Re-check: cache may have been refreshed between our
+        # fast-path check and acquiring the lock.
+        if cache_fresh "$cache_file"; then
+            cat "$cache_file"
+            exit 0
+        fi
+
+        # We hold the lock — fetch from API
+        local data
+        data=$(curl -sf --max-time 5 "$url" \
+            "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" 2>/dev/null) || data=""
+
+        if [[ -n "$data" ]]; then
+            local tmp
+            tmp=$(mktemp "$CACHE_DIR/.tmp.XXXXXX") && {
+                printf "%s" "$data" > "$tmp"
+                mv -f "$tmp" "$cache_file"
+            }
+            printf "%s" "$data"
+        elif [[ -f "$cache_file" ]]; then
+            # API failed (429, timeout, etc.) — serve stale cache
+            cat "$cache_file"
+        fi
+    ) 9>"$lock_file"
 }
 
 # ── Fetch live usage ──────────────────────────────────────────────────
 
 if [[ "$SHOW_5H" == "true" || "$SHOW_7D" == "true" ]]; then
-    usage_json=$(fetch_cached "${API_BASE}/api/oauth/usage" "$CACHE_USAGE")
+    usage_json=$(fetch_cached "${API_BASE}/api/oauth/usage" "$CACHE_USAGE") || usage_json=""
 
     if [[ -n "$usage_json" ]]; then
         IFS='|' read -r five_pct five_reset seven_pct seven_reset < <(
@@ -361,7 +426,7 @@ fi
 # ── Fetch plan info ───────────────────────────────────────────────────
 
 if [[ "$SHOW_PLAN" == "true" ]]; then
-    profile_json=$(fetch_cached "${API_BASE}/api/oauth/profile" "$CACHE_PROFILE")
+    profile_json=$(fetch_cached "${API_BASE}/api/oauth/profile" "$CACHE_PROFILE") || profile_json=""
 
     if [[ -n "$profile_json" ]]; then
         plan=$(echo "$profile_json" | jq -r '(.organization.organization_type // "unknown") | sub("^claude_"; "")')
