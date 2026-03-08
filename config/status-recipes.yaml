@@ -1,0 +1,23 @@
+# Status-right recipes — process-aware status bar content
+# Evaluated top-to-bottom by the dispatcher; first match wins.
+# Fallback (no match): timezone display
+#
+# match:  regex pattern against pane_current_command (converted to case glob)
+# run:    shell command whose stdout becomes status-right content
+#
+# Tokens expanded at generation time:
+#   {config}  — path to the session's YAML config file
+
+recipes:
+  - name: claude
+    match: ^claude$
+    run: >-
+      claude-usage --no-plan --cache-ttl 90
+
+  - name: node-dev
+    match: ^(node|npm)$
+    run: node-dev-status
+
+  # - name: ssh
+  #   match: ^(ssh|mosh-client)$
+  #   run: ssh-status

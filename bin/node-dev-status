@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║ node-dev-status — Show script, port, cpu/mem, uptime for node      ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+#
+# Designed for tmux status-right via the session-manager dispatcher.
+# Receives PANE_PID from the dispatcher (exported) to identify the
+# correct node process within the active pane's process tree.
+#
+# Output: » [dev :8787] 2% 315M 7m
+#
+# Environment:
+#   PANE_PID    PID of the pane's shell (set by dispatcher)
+
+set -euo pipefail
+
+# ── Find all descendant processes of the pane ─────────────────────────
+
+pane_pid="${PANE_PID:-}"
+[[ -z "$pane_pid" ]] && exit 0
+
+# Collect all descendant PIDs in one ps call (avoids recursive pgrep).
+declare -A children_of=()
+while read -r local_pid local_ppid; do
+    [[ -z "$local_pid" ]] && continue
+    children_of["$local_ppid"]+="$local_pid "
+done < <(ps -eo pid=,ppid= 2>/dev/null)
+
+desc_pids=()
+queue=("$pane_pid")
+while [[ ${#queue[@]} -gt 0 ]]; do
+    current="${queue[0]}"
+    queue=("${queue[@]:1}")
+    for child in ${children_of["$current"]:-}; do
+        desc_pids+=("$child")
+        queue+=("$child")
+    done
+done
+
+[[ ${#desc_pids[@]} -eq 0 ]] && exit 0
+
+# ── Extract npm script name from process tree ─────────────────────────
+# Look for "npm run <script>" in the cmdline of descendant npm processes.
+
+script_name=""
+for pid in "${desc_pids[@]}"; do
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+    if [[ "$cmdline" =~ npm[[:space:]]+run[[:space:]]+([^[:space:]]+) ]]; then
+        script_name="${BASH_REMATCH[1]}"
+        break
+    fi
+done
+
+# ── Identify node runtime processes via /proc/pid/exe ─────────────────
+
+node_pids=()
+for pid in "${desc_pids[@]}"; do
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+    case "$(basename "$exe")" in
+        node|bun) node_pids+=("$pid") ;;
+    esac
+done
+
+[[ ${#node_pids[@]} -eq 0 ]] && exit 0
+
+# Use the shallowest (first) node process for primary stats
+node_pid="${node_pids[0]}"
+
+# ── Gather process info ──────────────────────────────────────────────
+
+# Listening ports across ALL descendant processes (node, workerd, etc.)
+_collect_ports() {
+    local ss_output
+    ss_output=$(ss -tlnp 2>/dev/null) || return
+
+    local pid_pattern=""
+    for pid in "${desc_pids[@]}"; do
+        [[ -n "$pid_pattern" ]] && pid_pattern+="|"
+        pid_pattern+="pid=${pid}[,)]"
+    done
+
+    local all_ports
+    all_ports=$(echo "$ss_output" \
+        | grep -E "$pid_pattern" \
+        | awk '{print $4}' \
+        | awk -F: '{print $NF}' | grep -E '^[0-9]+$' \
+        | sort -un)
+
+    [[ -z "$all_ports" ]] && return
+
+    # Prefer ports bound to 0.0.0.0 (user-facing), exclude debug/ephemeral
+    local public_ports
+    public_ports=$(echo "$ss_output" \
+        | grep -E "$pid_pattern" \
+        | grep '0.0.0.0:' \
+        | awk '{print $4}' \
+        | awk -F: '{print $NF}' | grep -E '^[0-9]+$' \
+        | grep -vE '^(9229|9230)$' \
+        | awk '$1 < 30000' \
+        | sort -un \
+        | head -2)
+
+    if [[ -n "$public_ports" ]]; then
+        echo "$public_ports" | tr '\n' ',' | sed 's/,$//'
+    else
+        echo "$all_ports" | awk '$1 < 30000' | head -2 | tr '\n' ',' | sed 's/,$//'
+    fi
+}
+
+ports=$(_collect_ports)
+
+# CPU % — sum across all node processes
+cpu_total=0
+for pid in "${node_pids[@]}"; do
+    cpu=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ') || continue
+    [[ -n "$cpu" ]] && cpu_total=$(awk "BEGIN {print $cpu_total + $cpu}")
+done
+# Format: round to int, always show (0% = idle confirmation)
+cpu_str=$(awk "BEGIN {printf \"%.0f\", $cpu_total}" 2>/dev/null) || cpu_str="0"
+
+# RSS memory (KB → MB) — sum across all node processes
+rss_total=0
+for pid in "${node_pids[@]}"; do
+    rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ') || continue
+    [[ -n "$rss_kb" ]] && (( rss_total += rss_kb )) || true
+done
+rss=""
+(( rss_total > 0 )) && rss="$((rss_total / 1024))M"
+
+# Uptime of the shallowest node process (use lstart to avoid etimes overflow)
+uptime_str=""
+lstart=$(ps -o lstart= -p "$node_pid" 2>/dev/null | xargs) || lstart=""
+if [[ -n "$lstart" ]]; then
+    start_epoch=$(date -d "$lstart" +%s 2>/dev/null) || start_epoch=""
+    if [[ -n "$start_epoch" ]]; then
+        elapsed=$(( $(date +%s) - start_epoch ))
+        if (( elapsed >= 86400 )); then
+            uptime_str="$((elapsed / 86400))d$((elapsed % 86400 / 3600))h"
+        elif (( elapsed >= 3600 )); then
+            uptime_str="$((elapsed / 3600))h$(printf '%02d' $((elapsed % 3600 / 60)))m"
+        elif (( elapsed >= 60 )); then
+            uptime_str="$((elapsed / 60))m"
+        else
+            uptime_str="${elapsed}s"
+        fi
+    fi
+fi
+
+# ── Format output ────────────────────────────────────────────────────
+# » [dev:8787] 0% 322M 45m
+
+label="${script_name:-node}"
+
+output="» [${label}"
+[[ -n "$ports" ]] && output+=":${ports}"
+output+="]"
+
+stats=()
+stats+=("${cpu_str}%")
+[[ -n "$rss" ]]        && stats+=("$rss")
+[[ -n "$uptime_str" ]] && stats+=("$uptime_str")
+
+if [[ ${#stats[@]} -gt 0 ]]; then
+    for stat in "${stats[@]}"; do
+        output+=" ${stat}"
+    done
+elif [[ -z "$ports" ]]; then
+    output+=" starting"
+fi
+
+echo "$output"

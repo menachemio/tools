@@ -156,10 +156,6 @@ refresh_subsession() {
         die "Subsession '$name' is not running"
     fi
 
-    if [[ -z "${TIMEZONE_SCRIPT:-}" ]]; then
-        TIMEZONE_SCRIPT=$(create_timezone_script)
-    fi
-
     _apply_subsession_color "$name"
     apply_tmux_subsession_options "$name"
 
@@ -201,15 +197,10 @@ ensure_subsession() {
 _apply_subsession_color() {
     local name="$1"
 
-    # Create timezone script if not already set
-    if [[ -z "${TIMEZONE_SCRIPT:-}" ]]; then
-        TIMEZONE_SCRIPT=$(create_timezone_script)
-    fi
-
     # Subsession-level color takes priority over window color
     local sub_color=$(yaml_get_subsession "$name" "color")
     if [[ -n "$sub_color" ]]; then
-        apply_subsession_colors "$name" "$sub_color" "$TIMEZONE_SCRIPT"
+        apply_subsession_colors "$name" "$sub_color"
         return 0
     fi
 
@@ -222,7 +213,7 @@ _apply_subsession_color() {
                   "$(yaml_get_pane "$win_name" "$pi" "subsession")" == "$name" ]]; then
                 local wcolor=$(yaml_get_window "$win_name" "color")
                 if [[ -n "$wcolor" ]]; then
-                    apply_subsession_colors "$name" "$wcolor" "$TIMEZONE_SCRIPT"
+                    apply_subsession_colors "$name" "$wcolor"
                 fi
                 return 0
             fi
@@ -234,12 +225,11 @@ _apply_subsession_color() {
 apply_subsession_colors() {
     local name="$1"
     local color="$2"
-    local timezone_script="$3"
 
     [[ -z "$color" ]] && return
     subsession_exists "$name" || return
 
-    _apply_color_defaults "$name" "$color" "$timezone_script" \
+    _apply_color_defaults "$name" "$color" \
         "$(yaml_get_tmux_subsession "$name" "status-style")" \
         "$(yaml_get_tmux_subsession "$name" "status-left")" \
         "$(yaml_get_tmux_subsession "$name" "status-right")"

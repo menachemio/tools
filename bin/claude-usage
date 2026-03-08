@@ -161,47 +161,45 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common/clock.sh"
+
 # ── Defaults & CLI parsing ────────────────────────────────────────────
 
 CREDS_FILE="${HOME}/.claude/.credentials.json"
 API_BASE="https://api.anthropic.com"
 BETA_HEADER="oauth-2025-04-20"
 TIME_FORMAT="countdown"   # "countdown" or "clock"
-CLOCK_FORMAT="24h"        # "24h" (18:00) or "12h" (6:00 PM)
-TIMEZONE=""                # empty = UTC, set via --timezone or --timezone-from-config
-CONFIG_FILE=""             # --timezone-from-config <path>
 CACHE_TTL=""               # empty = no caching; seconds between API refreshes if set
 CACHE_DIR="${XDG_RUNTIME_DIR:-${HOME}/.cache}/claude-usage"
-SHOW_TIME=false            # --with-time: append current clock to output
 SHOW_5H=true               # --no-5h: hide 5-hour period
 SHOW_7D=true               # --no-7d: hide 7-day period
 SHOW_PLAN=true             # --no-plan: hide plan type
 
+# Parse shared clock flags (--with-time, --clock-format, --timezone, --timezone-from-config)
+clock_parse_args "$@"
+
+# Parse claude-usage-specific flags
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --time-format)          TIME_FORMAT="$2"; shift 2 ;;
-        --clock-format)         CLOCK_FORMAT="$2"; shift 2 ;;
-        --timezone)             TIMEZONE="$2";    shift 2 ;;
-        --timezone-from-config) CONFIG_FILE="$2"; shift 2 ;;
-        --cache-ttl)            CACHE_TTL="$2";   shift 2 ;;
-        --with-time)            SHOW_TIME=true;    shift ;;
+        --time-format)          TIME_FORMAT="${2:-$TIME_FORMAT}"; shift; [[ $# -gt 0 ]] && shift ;;
+        --cache-ttl)            CACHE_TTL="${2:-$CACHE_TTL}";   shift; [[ $# -gt 0 ]] && shift ;;
         --no-5h)               SHOW_5H=false;     shift ;;
         --no-7d)               SHOW_7D=false;     shift ;;
         --no-plan)             SHOW_PLAN=false;    shift ;;
         -h|--help)
             sed -n '/^# ── USAGE/,/^# ── DISCOVERY/{ /^# ── DISCOVERY/d; p; }' "$0" | sed 's/^# \{0,3\}//'
             exit 0 ;;
+        --clock-format|--timezone|--timezone-from-config)
+            shift 2 ;;  # skip clock flags (handled by clock_parse_args)
+        --with-time)
+            shift ;;    # skip clock flag
         *)  echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
-# --timezone-from-config: extract "timezone:" from the YAML, but only if
-# --timezone wasn't explicitly provided (explicit flag wins).
-if [[ -z "$TIMEZONE" && -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
-    tz_from_config=$(sed -n 's/^timezone:\s*//p' "$CONFIG_FILE" | tr -d '[:space:]')
-    [[ -n "$tz_from_config" ]] && TIMEZONE="$tz_from_config"
-fi
-TIMEZONE="${TIMEZONE:-UTC}"
+# Alias shared clock timezone for use in fmt_clock/fmt_reset
+TIMEZONE="$CLOCK_TIMEZONE"
 
 # ── Preflight ─────────────────────────────────────────────────────────
 
@@ -456,16 +454,4 @@ for i in "${!parts[@]}"; do
     fi
 done
 
-if [[ "$SHOW_TIME" == "true" ]]; then
-    if [[ "$CLOCK_FORMAT" == "12h" ]]; then
-        current_time=$(TZ="$TIMEZONE" date "+%-I:%M %p %Z")
-    else
-        current_time=$(TZ="$TIMEZONE" date "+%H:%M %Z")
-    fi
-    if [[ ${#parts[@]} -gt 0 ]]; then
-        output+=" |"
-    fi
-    output+=" ${current_time}"
-fi
-
-echo "$output"
+clock_append "$output"

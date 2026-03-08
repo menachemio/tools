@@ -306,7 +306,8 @@ main() {
 
     # Generate tmux config and source once (covers all code paths)
     TIMEZONE_SCRIPT=$(create_timezone_script)
-    create_tmux_config "$TIMEZONE_SCRIPT"
+    _init_status_right_cmd
+    create_tmux_config
     _tmux source-file "${TOOLS_RUNTIME_DIR}/session-tmux.conf" 2>/dev/null || true
 
     # Handle subsession commands

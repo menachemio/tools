@@ -9,6 +9,7 @@ CONFIG_FILE=""
 CONFIG_DIR=""
 SESSION_NAME=""
 TIMEZONE_SCRIPT=""
+STATUS_RIGHT_CMD=""
 VERBOSE="${VERBOSE:-false}"
 
 # Leading space prefix for tmux send-keys commands.
@@ -177,12 +178,114 @@ EOF
     echo "$script"
 }
 
+# Parse status-recipes.yaml and generate a dispatcher script.
+# The generated script is a pure case/esac — no YAML parsing at runtime.
+# Receives $1 = path to recipes YAML file.
+_create_dispatcher_script() {
+    local recipes_file="$1"
+    local script="${TOOLS_RUNTIME_DIR}/${SESSION_NAME}-dispatch.sh"
+
+    # Parse recipes into parallel arrays
+    local -a matches=() runs=()
+    local match="" run="" in_fold=false
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+
+        # New recipe block
+        if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*name: ]]; then
+            if [[ -n "$match" && -n "$run" ]]; then
+                matches+=("$match"); runs+=("$run")
+            fi
+            match="" run="" in_fold=false
+            continue
+        fi
+
+        # Match pattern
+        if [[ "$line" =~ ^[[:space:]]*match:[[:space:]]*(.*) ]]; then
+            match="${BASH_REMATCH[1]}"
+            in_fold=false
+            continue
+        fi
+
+        # Run: folded scalar (>-)
+        if [[ "$line" =~ ^[[:space:]]*run:[[:space:]]*\>-[[:space:]]*$ ]]; then
+            run="" in_fold=true
+            continue
+        fi
+
+        # Run: inline value
+        if [[ "$line" =~ ^[[:space:]]*run:[[:space:]]*(.*) ]]; then
+            run="${BASH_REMATCH[1]}"
+            in_fold=false
+            continue
+        fi
+
+        # Folded continuation line
+        if [[ "$in_fold" == true && "$line" =~ ^[[:space:]]+(.*) ]]; then
+            local trimmed="${BASH_REMATCH[1]}"
+            run="${run:+$run }$trimmed"
+        fi
+    done < "$recipes_file"
+
+    # Flush last recipe
+    if [[ -n "$match" && -n "$run" ]]; then
+        matches+=("$match"); runs+=("$run")
+    fi
+
+    # Generate dispatcher script
+    # $1 = pane_current_command, $2 = pane_pid (both expanded by tmux)
+    {
+        echo '#!/bin/bash'
+        echo 'export PANE_PID="$2"'
+        echo 'case "$1" in'
+        for ((i=0; i<${#matches[@]}; i++)); do
+            local pattern="${matches[$i]}"
+            local cmd="${runs[$i]}"
+            # Regex to case pattern: strip anchors and outer parens
+            pattern="${pattern#^}"; pattern="${pattern%\$}"
+            [[ "$pattern" == \(*\) ]] && pattern="${pattern#(}" && pattern="${pattern%)}"
+            # Expand tokens (quote config path for spaces)
+            local quoted_config="${CONFIG_FILE//\'/\'\\\'\'}"
+            cmd="${cmd//\{config\}/\'$quoted_config\'}"
+            printf '  %s)\n    exec %s\n    ;;\n' "$pattern" "$cmd"
+        done
+        echo 'esac'
+        printf 'exec "%s"\n' "$TIMEZONE_SCRIPT"
+    } > "$script"
+
+    chmod +x "$script"
+    echo "$script"
+}
+
+# Initialize STATUS_RIGHT_CMD: dispatcher if recipes exist, else timezone.
+# Must be called after TIMEZONE_SCRIPT and CONFIG_FILE are set.
+# Safe to call multiple times (idempotent); also used as a lazy-init guard
+# by _apply_color_defaults when called from isolated code paths.
+_init_status_right_cmd() {
+    # Generate timezone script if not yet created (lazy-init for
+    # code paths that reach here without full session setup)
+    if [[ -z "${TIMEZONE_SCRIPT:-}" ]]; then
+        TIMEZONE_SCRIPT=$(create_timezone_script)
+    fi
+
+    local recipes_file="${CORE_DIR}/../../config/status-recipes.yaml"
+    if [[ -f "$recipes_file" ]]; then
+        local dispatcher
+        dispatcher=$(_create_dispatcher_script "$recipes_file")
+        STATUS_RIGHT_CMD="#(${dispatcher} #{pane_current_command} #{pane_pid})"
+    else
+        STATUS_RIGHT_CMD="#(${TIMEZONE_SCRIPT})"
+    fi
+}
+
 # Create tmux configuration
 # Authoritative config loaded via -f on the dedicated socket (SM_SOCKET).
 # The -L socket isolates session-manager; -f seeds config on first server start.
 # Options under tmux.global in YAML override these defaults.
 create_tmux_config() {
-    local timezone_script="$1"
     local conf="${TOOLS_RUNTIME_DIR}/session-tmux.conf"
 
     # Resolve all options: YAML tmux.global override -> hardcoded default.
@@ -206,7 +309,8 @@ create_tmux_config() {
     local opt_status_right_length="${YAML_VALUES["tmux_global_status-right-length"]:-100}"
     local opt_status_style="${YAML_VALUES["tmux_global_status-style"]:-bg=black,fg=white}"
     local opt_status_left="${YAML_VALUES["tmux_global_status-left"]:- #S  }"
-    local opt_status_right="${YAML_VALUES["tmux_global_status-right"]:-#($timezone_script)}"
+    local default_sr="${STATUS_RIGHT_CMD:-}"
+    local opt_status_right="${YAML_VALUES["tmux_global_status-right"]:-$default_sr}"
     local opt_pane_border_style="${YAML_VALUES["tmux_global_pane-border-style"]:-fg=brightblack}"
     local opt_pane_active_border_style="${YAML_VALUES["tmux_global_pane-active-border-style"]:-fg=white}"
     local opt_mode_keys="${YAML_VALUES["tmux_global_mode-keys"]:-vi}"
@@ -354,8 +458,8 @@ exclude_from_resurrect() {
 # The legacy `color:` top-level key is syntactic sugar for tmux.session status options.
 # If tmux.session options are defined, they take priority over `color:`.
 _apply_color_defaults() {
-    local target="$1" color="$2" timezone_script="$3"
-    local ov_style="$4" ov_left="$5" ov_right="$6"
+    local target="$1" color="$2"
+    local ov_style="$3" ov_left="$4" ov_right="$5"
 
     [[ -z "$color" ]] && return
 
@@ -365,14 +469,16 @@ _apply_color_defaults() {
     if [[ -z "$ov_left" ]]; then
         _tmux set-option -t "$target" status-left "#[fg=${color},bold] #S #[default]" 2>/dev/null || true
     fi
-    if [[ -n "$timezone_script" && -z "$ov_right" ]]; then
-        _tmux set-option -t "$target" status-right "#[fg=${color}] #($timezone_script) #[default]" 2>/dev/null || true
+    # Lazy-init: ensure STATUS_RIGHT_CMD is set even if reached from
+    # an isolated code path (e.g. refresh_subsession without full init)
+    [[ -z "${STATUS_RIGHT_CMD:-}" ]] && _init_status_right_cmd
+    if [[ -n "${STATUS_RIGHT_CMD:-}" && -z "$ov_right" ]]; then
+        _tmux set-option -t "$target" status-right "#[fg=${color}] ${STATUS_RIGHT_CMD} #[default]" 2>/dev/null || true
     fi
 }
 
 apply_session_colors() {
     local session_name="$1"
-    local timezone_script="$2"
 
     wait_for_target "$session_name" || { log "Skipping colors for $session_name"; return; }
 
@@ -382,7 +488,7 @@ apply_session_colors() {
     local session_color=$(yaml_get "color")
     [[ -z "$session_color" ]] && return
 
-    _apply_color_defaults "$session_name" "$session_color" "$timezone_script" \
+    _apply_color_defaults "$session_name" "$session_color" \
         "$(yaml_get_tmux_session "status-style")" \
         "$(yaml_get_tmux_session "status-left")" \
         "$(yaml_get_tmux_session "status-right")"
@@ -576,7 +682,8 @@ start_session() {
     # Regenerate config if missing (bin/session pre-generates, but restart deletes it)
     if [[ ! -f "${TOOLS_RUNTIME_DIR}/session-tmux.conf" ]]; then
         TIMEZONE_SCRIPT=$(create_timezone_script)
-        create_tmux_config "$TIMEZONE_SCRIPT"
+        _init_status_right_cmd
+        create_tmux_config
     fi
 
     # Warn about missing binaries referenced in pane commands and subsessions
@@ -622,7 +729,7 @@ start_session() {
         die "Failed to create tmux session: $SESSION_NAME"
     _tmux set-option -u window-size 2>/dev/null || true
     exclude_from_resurrect "$SESSION_NAME"
-    apply_session_colors "$SESSION_NAME" "$TIMEZONE_SCRIPT"
+    apply_session_colors "$SESSION_NAME"
 
     # Pre-create all subsessions and apply their colors/options in one pass
     log "Pre-creating subsessions..."
@@ -689,7 +796,7 @@ stop_session() {
         log "Session not running: $SESSION_NAME"
     fi
 
-    rm -f "${TOOLS_RUNTIME_DIR}/session-tmux.conf" "${TOOLS_RUNTIME_DIR}/${SESSION_NAME}-time.sh"
+    rm -f "${TOOLS_RUNTIME_DIR}/session-tmux.conf" "${TOOLS_RUNTIME_DIR}/${SESSION_NAME}-time.sh" "${TOOLS_RUNTIME_DIR}/${SESSION_NAME}-dispatch.sh"
 }
 
 # Show session status
@@ -722,13 +829,14 @@ refresh_session() {
 
     log "Refreshing session: $SESSION_NAME"
 
-    # Regenerate timezone script and tmux config, then re-source
+    # Regenerate timezone script, dispatcher, and tmux config, then re-source
     TIMEZONE_SCRIPT=$(create_timezone_script)
-    create_tmux_config "$TIMEZONE_SCRIPT"
+    _init_status_right_cmd
+    create_tmux_config
     _tmux source-file "${TOOLS_RUNTIME_DIR}/session-tmux.conf" 2>/dev/null || true
 
     # Re-apply session-level colors and options
-    apply_session_colors "$SESSION_NAME" "$TIMEZONE_SCRIPT"
+    apply_session_colors "$SESSION_NAME"
 
     # Re-apply per-window styling
     local running_windows
@@ -817,5 +925,5 @@ kill_all_sessions() {
     fi
 
     log "All sessions terminated"
-    rm -f "${TOOLS_RUNTIME_DIR}/session-tmux.conf" "${TOOLS_RUNTIME_DIR}/${SESSION_NAME}-time.sh"
+    rm -f "${TOOLS_RUNTIME_DIR}/session-tmux.conf" "${TOOLS_RUNTIME_DIR}/${SESSION_NAME}-time.sh" "${TOOLS_RUNTIME_DIR}/${SESSION_NAME}-dispatch.sh"
 }
