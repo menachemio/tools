@@ -191,7 +191,7 @@ while [[ $# -gt 0 ]]; do
             sed -n '/^# ── USAGE/,/^# ── DISCOVERY/{ /^# ── DISCOVERY/d; p; }' "$0" | sed 's/^# \{0,3\}//'
             exit 0 ;;
         --clock-format|--timezone|--timezone-from-config)
-            shift 2 ;;  # skip clock flags (handled by clock_parse_args)
+            shift; [[ $# -gt 0 ]] && shift ;;  # skip clock flags (handled by clock_parse_args)
         --with-time)
             shift ;;    # skip clock flag
         *)  echo "Unknown option: $1" >&2; exit 1 ;;
@@ -354,6 +354,18 @@ fetch_cached() {
         return
     fi
 
+    # Back off after recent API failure (15s cooldown, independent of cache TTL).
+    # Prevents sequential hammering when every call grabs the lock and retries.
+    local fail_file="${cache_file}.fail"
+    if [[ -n "$CACHE_TTL" && -f "$fail_file" ]]; then
+        local fail_age
+        fail_age=$(stat -c %Y "$fail_file" 2>/dev/null) || fail_age=0
+        if (( $(date +%s) - fail_age < 15 )); then
+            [[ -f "$cache_file" ]] && cat "$cache_file"
+            return
+        fi
+    fi
+
     # No caching — just fetch directly
     if [[ -z "$CACHE_TTL" ]]; then
         local data
@@ -392,10 +404,16 @@ fetch_cached() {
                 printf "%s" "$data" > "$tmp"
                 mv -f "$tmp" "$cache_file"
             }
+            rm -f "${cache_file}.fail" 2>/dev/null
             printf "%s" "$data"
-        elif [[ -f "$cache_file" ]]; then
-            # API failed (429, timeout, etc.) — serve stale cache
-            cat "$cache_file"
+        else
+            if [[ -f "$cache_file" ]]; then
+                # API failed — serve stale cache
+                cat "$cache_file"
+            fi
+            # Mark failure so subsequent callers back off instead of
+            # hammering the API (15s cooldown, independent of cache TTL).
+            touch "${cache_file}.fail" 2>/dev/null
         fi
     ) 9>"$lock_file"
 }
