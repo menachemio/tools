@@ -112,25 +112,36 @@
 #                               Without this flag, every call hits the API.
 #                               The usage endpoint allows ~5 req per 5 min.
 #                               Recommended: 90+ for tmux status bars.
+#     --no-audit                Disable API audit log (enabled by default).
+#                               Audit log: $CACHE_DIR/audit.log (~512KB cap).
+#     --debug                   Enable verbose trace logging to /tmp/.
+#                               Logs every invocation (cache hits, locks, etc).
+#
+#   Indicators:
+#     »  Fresh data (successful API response within cache TTL)
+#     ›  Stale data (API failing, serving cached data)
+#
+#   On API failure, retries use exponential backoff:
+#     15s → 30s → 60s → 120s → 300s (resets on success)
 #
 #   Examples:
 #     claude-usage
-#       ⚡ 5h 54% 2h05m | 7d 3% 6d22h | max
+#       » 5h 54% 2h05m | 7d 3% 6d22h | max
 #
 #     claude-usage --time-format clock --timezone America/New_York
-#       ⚡ 5h 54% 18:00 | 7d 3% 6d22h | max
+#       » 5h 54% 18:00 | 7d 3% 6d22h | max
 #
 #     claude-usage --time-format clock --clock-format 12h --timezone America/New_York
-#       ⚡ 5h 54% 6:00 PM | 7d 3% 6d22h | max
+#       » 5h 54% 6:00 PM | 7d 3% 6d22h | max
 #
 #     claude-usage --with-time --timezone America/New_York --cache-ttl 90
-#       ⚡ 5h 54% 2h05m | 7d 3% 6d22h | max | 15:30 EST
+#       » 5h 54% 2h05m | 7d 3% 6d22h | max | 15:30 EST
 #
 #     claude-usage --no-plan
-#       ⚡ 5h 54% 2h05m | 7d 3% 6d22h
+#       » 5h 54% 2h05m | 7d 3% 6d22h
 #
 #     claude-usage --no-7d --no-plan
-#       ⚡ 5h 54% 2h05m
+#       » 5h 54% 2h05m
 #
 #   tmux status-right (session manager):
 #     "#(claude-usage --with-time --cache-ttl 90 --timezone-from-config /path/to/config.yaml)"
@@ -190,6 +201,8 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             sed -n '/^# ── USAGE/,/^# ── DISCOVERY/{ /^# ── DISCOVERY/d; p; }' "$0" | sed 's/^# \{0,3\}//'
             exit 0 ;;
+        --debug)               DEBUG_LOG=1;       shift ;;
+        --no-audit)            AUDIT=0;           shift ;;
         --clock-format|--timezone|--timezone-from-config)
             shift; [[ $# -gt 0 ]] && shift ;;  # skip clock flags (handled by clock_parse_args)
         --with-time)
@@ -324,6 +337,38 @@ fmt_period() {
 CACHE_USAGE="${CACHE_DIR}/usage.json"
 CACHE_PROFILE="${CACHE_DIR}/profile.json"
 
+# ── Exponential backoff schedule ─────────────────────────────────────
+# On consecutive API failures, wait escalates: 15s → 30s → 60s → 120s → 300s.
+# Resets immediately on success. Independent of --cache-ttl.
+BACKOFF_STEPS=(15 30 60 120 300)
+
+# ── Debug logging ────────────────────────────────────────────────────
+# Set CLAUDE_USAGE_LOG=1 or pass --debug to enable verbose trace logging.
+# Logs every invocation: cache hits, API calls, lock contention, failures.
+LOG_FILE="/tmp/claude-usage-debug.log"
+DEBUG_LOG="${DEBUG_LOG:-${CLAUDE_USAGE_LOG:-0}}"
+_log() {
+    [[ "$DEBUG_LOG" != "1" ]] && return
+    printf "%s [pid=$$] %s\n" "$(date '+%H:%M:%S.%3N')" "$*" >> "$LOG_FILE"
+}
+
+# ── Audit logging ────────────────────────────────────────────────────
+# Lightweight append-only log of API calls only (not cache hits).
+# Designed to run permanently. Enabled by default; disable via --no-audit.
+# Rotates at 512KB, keeping the last 5000 entries.
+AUDIT_LOG="${CACHE_DIR}/audit.log"
+AUDIT="${AUDIT:-${CLAUDE_USAGE_AUDIT:-1}}"
+if [[ "$AUDIT" == "1" && -f "$AUDIT_LOG" ]]; then
+    _audit_size=$(stat -c %s "$AUDIT_LOG" 2>/dev/null) || _audit_size=0
+    if (( _audit_size > 524288 )); then
+        tail -5000 "$AUDIT_LOG" > "${AUDIT_LOG}.tmp" && mv -f "${AUDIT_LOG}.tmp" "$AUDIT_LOG"
+    fi
+fi
+_audit() {
+    [[ "$AUDIT" != "1" ]] && return
+    printf "%s %s\n" "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >> "$AUDIT_LOG"
+}
+
 # Check if a cache file is fresh (modified within TTL seconds).
 cache_fresh() {
     local file="$1"
@@ -338,90 +383,174 @@ cache_fresh() {
 # Fetch with optional caching. Args: <url> <cache_file>
 # Prints the JSON to stdout.
 #
+# Return codes:
+#   0 = fresh data (cache hit or successful API call)
+#   2 = stale data served (API failed, backoff active, or lock busy)
+#   1 = no data at all (no cache and API failed)
+#
 # When caching is enabled, uses flock to coordinate concurrent callers:
 #   1. Check cache without lock (fast path — no contention if fresh)
-#   2. Try non-blocking exclusive lock on <cache_file>.lock
-#      - If lock fails: serve stale cache immediately (or empty if none)
-#   3. Re-check cache (may have been refreshed between step 1 and lock)
-#   4. Fetch from API, write cache, release lock
-# If the API fails, serve stale cache as a fallback.
+#   2. Exponential backoff check (15s → 30s → 60s → 120s → 300s)
+#   3. Try non-blocking exclusive lock on <cache_file>.lock
+#      - If lock fails: serve stale cache immediately (return 2)
+#   4. Re-check cache (may have been refreshed between step 1 and lock)
+#   5. Fetch from API, write cache, release lock
+# If the API fails, serve stale cache as a fallback (return 2).
 fetch_cached() {
     local url="$1" cache_file="$2"
 
-    # Fast path: cache is fresh, no lock needed
-    if cache_fresh "$cache_file"; then
-        cat "$cache_file"
-        return
+    # Compute debug diagnostics only when logging is enabled (avoids
+    # redundant date/stat subprocesses on the ~96% cache-hit fast path).
+    local endpoint="" cache_age_str=""
+    if [[ "$DEBUG_LOG" == "1" ]]; then
+        endpoint="${url##*/}"
+        local now_dbg file_age_ts
+        now_dbg=$(date +%s)
+        if [[ -f "$cache_file" ]]; then
+            file_age_ts=$(stat -c %Y "$cache_file" 2>/dev/null) || file_age_ts=0
+            cache_age_str="age=$((now_dbg - file_age_ts))s ttl=${CACHE_TTL:-none}"
+        else
+            cache_age_str="no-cache-file ttl=${CACHE_TTL:-none}"
+        fi
     fi
 
-    # Back off after recent API failure (15s cooldown, independent of cache TTL).
-    # Prevents sequential hammering when every call grabs the lock and retries.
-    local fail_file="${cache_file}.fail"
-    if [[ -n "$CACHE_TTL" && -f "$fail_file" ]]; then
-        local fail_age
-        fail_age=$(stat -c %Y "$fail_file" 2>/dev/null) || fail_age=0
-        if (( $(date +%s) - fail_age < 15 )); then
-            [[ -f "$cache_file" ]] && cat "$cache_file"
-            return
+    # Fast path: cache is fresh, no lock needed
+    if cache_fresh "$cache_file"; then
+        _log "CACHE-HIT  $endpoint ($cache_age_str)"
+        cat "$cache_file"
+        return 0
+    fi
+
+    # Exponential backoff after API failure.
+    # .backoff file contains the step index (0-4); mtime = last failure time.
+    # Schedule: 15s → 30s → 60s → 120s → 300s. Resets on success.
+    local backoff_file="${cache_file}.backoff"
+    if [[ -n "$CACHE_TTL" && -f "$backoff_file" ]]; then
+        local step backoff_secs fail_mtime _now_s
+        step=$(cat "$backoff_file" 2>/dev/null) || step=0
+        [[ "$step" =~ ^[0-9]+$ ]] || step=0
+        backoff_secs="${BACKOFF_STEPS[$step]:-300}"
+        fail_mtime=$(stat -c %Y "$backoff_file" 2>/dev/null) || fail_mtime=0
+        _now_s=$(date +%s)
+        if (( _now_s - fail_mtime < backoff_secs )); then
+            _log "BACKOFF    $endpoint step=$step wait=${backoff_secs}s (elapsed=$((_now_s - fail_mtime))s)"
+            if [[ -f "$cache_file" ]]; then
+                cat "$cache_file"
+                return 2
+            fi
+            return 1
         fi
     fi
 
     # No caching — just fetch directly
     if [[ -z "$CACHE_TTL" ]]; then
-        local data
-        data=$(curl -sf --max-time 5 "$url" \
-            "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" 2>/dev/null) || data=""
-        printf "%s" "$data"
-        return
+        _log "API-CALL   $endpoint (no-cache-mode)"
+        local response http_code data
+        response=$(curl -s --max-time 5 -w '\n__HTTP__%{http_code}__%{time_total}' "$url" \
+            "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" 2>/dev/null) || response=""
+        if [[ "$response" == *__HTTP__* ]]; then
+            local meta="${response##*__HTTP__}"
+            http_code="${meta%%__*}"
+            data="${response%$'\n'__HTTP__*}"
+        else
+            http_code="000"; data=""
+        fi
+        if [[ "$http_code" == "200" && -n "$data" ]]; then
+            _log "API-OK     $endpoint (http=$http_code)"
+            _audit "API ${endpoint:-usage} $http_code ${#data}B"
+            printf "%s" "$data"
+            return 0
+        else
+            _log "API-FAIL   $endpoint (http=$http_code)"
+            _audit "API ${endpoint:-usage} $http_code FAIL"
+            return 1
+        fi
     fi
 
     local lock_file="${cache_file}.lock"
     mkdir -p "$CACHE_DIR" 2>/dev/null
 
+    _log "CACHE-STALE $endpoint ($cache_age_str) — attempting lock"
+
     # Non-blocking lock: if another process is already fetching, serve
     # stale cache immediately rather than queueing behind it.
     (
         if ! flock -n 9; then
+            _log "LOCK-BUSY  $endpoint — serving stale cache"
             [[ -f "$cache_file" ]] && cat "$cache_file"
-            exit 0
+            exit 2
         fi
+
+        _log "LOCK-ACQ   $endpoint — got lock"
 
         # Re-check: cache may have been refreshed between our
         # fast-path check and acquiring the lock.
         if cache_fresh "$cache_file"; then
+            _log "LOCK-FRESH $endpoint — refreshed by another process"
             cat "$cache_file"
             exit 0
         fi
 
         # We hold the lock — fetch from API
-        local data
-        data=$(curl -sf --max-time 5 "$url" \
-            "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" 2>/dev/null) || data=""
+        _log "API-CALL   $endpoint — fetching"
+        local response http_code curl_time data
+        response=$(curl -s --max-time 5 -w '\n__HTTP__%{http_code}__%{time_total}' "$url" \
+            "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" 2>/dev/null) || response=""
 
-        if [[ -n "$data" ]]; then
+        if [[ "$response" == *__HTTP__* ]]; then
+            local meta="${response##*__HTTP__}"
+            http_code="${meta%%__*}"
+            curl_time="${meta##*__}"
+            data="${response%$'\n'__HTTP__*}"
+        else
+            http_code="000"; curl_time="?"; data=""
+        fi
+
+        if [[ "$http_code" == "200" && -n "$data" ]]; then
+            _log "API-OK     $endpoint (http=$http_code, ${#data}B, ${curl_time}s)"
+            _audit "API ${endpoint:-usage} $http_code ${#data}B ${curl_time}s"
             local tmp
             tmp=$(mktemp "$CACHE_DIR/.tmp.XXXXXX") && {
                 printf "%s" "$data" > "$tmp"
                 mv -f "$tmp" "$cache_file"
             }
-            rm -f "${cache_file}.fail" 2>/dev/null
+            rm -f "$backoff_file" 2>/dev/null
             printf "%s" "$data"
+            exit 0
         else
-            if [[ -f "$cache_file" ]]; then
-                # API failed — serve stale cache
-                cat "$cache_file"
+            # Escalate backoff: first failure → step 0 (15s), then increment
+            local next_step=0
+            if [[ -f "$backoff_file" ]]; then
+                local prev_step
+                prev_step=$(cat "$backoff_file" 2>/dev/null) || prev_step=0
+                [[ "$prev_step" =~ ^[0-9]+$ ]] || prev_step=0
+                next_step=$(( prev_step + 1 ))
+                local max_step=$(( ${#BACKOFF_STEPS[@]} - 1 ))
+                (( next_step > max_step )) && next_step=$max_step
             fi
-            # Mark failure so subsequent callers back off instead of
-            # hammering the API (15s cooldown, independent of cache TTL).
-            touch "${cache_file}.fail" 2>/dev/null
+            printf "%d" "$next_step" > "$backoff_file"
+
+            _log "API-FAIL   $endpoint (http=$http_code, step=$next_step, backoff=${BACKOFF_STEPS[$next_step]}s)"
+            _audit "API ${endpoint:-usage} $http_code FAIL ${curl_time}s step=$next_step"
+
+            if [[ -f "$cache_file" ]]; then
+                _log "STALE-SERVE $endpoint — serving stale after failure"
+                cat "$cache_file"
+                exit 2
+            fi
+            exit 1
         fi
     ) 9>"$lock_file"
 }
 
 # ── Fetch live usage ──────────────────────────────────────────────────
 
+_stale=false
+
 if [[ "$SHOW_5H" == "true" || "$SHOW_7D" == "true" ]]; then
-    usage_json=$(fetch_cached "${API_BASE}/api/oauth/usage" "$CACHE_USAGE") || usage_json=""
+    usage_json=$(fetch_cached "${API_BASE}/api/oauth/usage" "$CACHE_USAGE") && usage_rc=0 || usage_rc=$?
+    (( usage_rc == 2 )) && _stale=true
+    (( usage_rc == 1 )) && usage_json=""
 
     if [[ -n "$usage_json" ]]; then
         IFS='|' read -r five_pct five_reset seven_pct seven_reset < <(
@@ -442,7 +571,9 @@ fi
 # ── Fetch plan info ───────────────────────────────────────────────────
 
 if [[ "$SHOW_PLAN" == "true" ]]; then
-    profile_json=$(fetch_cached "${API_BASE}/api/oauth/profile" "$CACHE_PROFILE") || profile_json=""
+    profile_json=$(fetch_cached "${API_BASE}/api/oauth/profile" "$CACHE_PROFILE") && profile_rc=0 || profile_rc=$?
+    (( profile_rc == 2 )) && _stale=true
+    (( profile_rc == 1 )) && profile_json=""
 
     if [[ -n "$profile_json" ]]; then
         plan=$(echo "$profile_json" | jq -r '(.organization.organization_type // "unknown") | sub("^claude_"; "")')
@@ -464,7 +595,12 @@ if [[ "$SHOW_PLAN" == "true" ]]; then
     parts+=("$plan")
 fi
 
-output="»"
+# » = fresh data, › = serving stale cache (API failing)
+if [[ "$_stale" == "true" ]]; then
+    output="›"
+else
+    output="»"
+fi
 for i in "${!parts[@]}"; do
     output+=" ${parts[$i]}"
     if (( i < ${#parts[@]} - 1 )); then

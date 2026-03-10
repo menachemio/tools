@@ -12,7 +12,7 @@ recipes:
   - name: claude
     match: ^claude$
     run: >-
-      claude-usage --no-plan --cache-ttl 90
+      claude-usage --no-plan --cache-ttl 120
 
   - name: node-dev
     match: ^(node|npm)$
