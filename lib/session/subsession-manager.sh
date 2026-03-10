@@ -4,8 +4,10 @@
 # yaml-parser.sh is sourced by core.sh before this file
 
 # Check if a subsession exists and is running
+# All functions accept the SHORT name; the ${SESSION_NAME}/ prefix is added
+# internally so tmux session names are namespaced per parent session.
 subsession_exists() {
-    _tmux has-session -t "$1" 2>/dev/null
+    _tmux has-session -t "${SESSION_NAME}/$1" 2>/dev/null
 }
 
 # Start a new subsession
@@ -17,6 +19,8 @@ start_subsession() {
     local env_vars="$5"
     local execute="${6:-true}"
     local history="${7:-false}"
+
+    local tid="${SESSION_NAME}/${name}"
 
     if subsession_exists "$name"; then
         return 0
@@ -30,13 +34,13 @@ start_subsession() {
     local tmux_conf="${TOOLS_RUNTIME_DIR}/session-tmux.conf"
     local tmux_new_flags=()
     [[ -f "$tmux_conf" ]] && tmux_new_flags+=(-f "$tmux_conf")
-    if ! _tmux "${tmux_new_flags[@]}" new-session -d -s "$name" -c "$dir" 2>/dev/null; then
+    if ! _tmux "${tmux_new_flags[@]}" new-session -d -s "$tid" -c "$dir" 2>/dev/null; then
         log "Failed to create subsession $name"
         return 1
     fi
 
     # Subsession baseline defaults (before color/tmux overrides)
-    _tmux set-option -t "$name" status-justify left 2>/dev/null || true
+    _tmux set-option -t "$tid" status-justify left 2>/dev/null || true
 
     # Build export prefix from environment variables if provided
     local export_prefix=""
@@ -68,17 +72,17 @@ start_subsession() {
             if [[ "$execute" == "false" ]]; then
                 # Pre-fill command text without executing (env vars still exported first)
                 if [[ -n "$export_prefix" ]]; then
-                    _tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix%%; }" Enter 2>/dev/null || true
+                    _tmux send-keys -t "$tid" "${HIST_SKIP}${export_prefix%%; }" Enter 2>/dev/null || true
                 fi
-                _tmux send-keys -t "$name" "$command" 2>/dev/null || true
+                _tmux send-keys -t "$tid" "$command" 2>/dev/null || true
             else
-                _tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix}${command}" Enter 2>/dev/null || true
+                _tmux send-keys -t "$tid" "${HIST_SKIP}${export_prefix}${command}" Enter 2>/dev/null || true
                 if [[ "$history" == "true" ]]; then
                     echo "$command" >> ~/.bash_history
                 fi
             fi
         elif [[ -n "$export_prefix" ]]; then
-            _tmux send-keys -t "$name" "${HIST_SKIP}${export_prefix%%; }" Enter 2>/dev/null || true
+            _tmux send-keys -t "$tid" "${HIST_SKIP}${export_prefix%%; }" Enter 2>/dev/null || true
         fi
     }
 
@@ -88,7 +92,7 @@ start_subsession() {
         _send_subsession_command
     fi
 
-    exclude_from_resurrect "$name"
+    exclude_from_resurrect "$tid"
     return 0
 }
 
@@ -98,15 +102,17 @@ attach_pane_to_subsession() {
     local subsession="$2"
     local cmd="${3:-}"
 
+    local tid="${SESSION_NAME}/${subsession}"
+
     if ! subsession_exists "$subsession"; then
         log "Subsession $subsession does not exist"
         return 1
     fi
 
     if [[ -n "$cmd" ]]; then
-        _tmux send-keys -t "$subsession" "${HIST_SKIP}$cmd" Enter 2>/dev/null || true
+        _tmux send-keys -t "$tid" "${HIST_SKIP}$cmd" Enter 2>/dev/null || true
     fi
-    _tmux send-keys -t "$pane" "${HIST_SKIP}TMUX= tmux -L '${SM_SOCKET}' attach-session -t '${subsession}' || exec bash" Enter 2>/dev/null || return 1
+    _tmux send-keys -t "$pane" "${HIST_SKIP}TMUX= tmux -L '${SM_SOCKET}' attach-session -t '${tid}' || exec bash" Enter 2>/dev/null || return 1
     return 0
 }
 
@@ -119,7 +125,7 @@ stop_subsession() {
         return 0
     fi
 
-    _tmux kill-session -t "$name" 2>/dev/null || true
+    _tmux kill-session -t "${SESSION_NAME}/${name}" 2>/dev/null || true
     log "Stopped subsession: $name"
     return 0
 }
@@ -229,7 +235,7 @@ apply_subsession_colors() {
     [[ -z "$color" ]] && return
     subsession_exists "$name" || return
 
-    _apply_color_defaults "$name" "$color" \
+    _apply_color_defaults "${SESSION_NAME}/${name}" "$color" \
         "$(yaml_get_tmux_subsession "$name" "status-style")" \
         "$(yaml_get_tmux_subsession "$name" "status-left")" \
         "$(yaml_get_tmux_subsession "$name" "status-right")"
@@ -238,5 +244,5 @@ apply_subsession_colors() {
 # Apply per-subsession tmux options from YAML (uses shared _apply_tmux_opts from core.sh)
 apply_tmux_subsession_options() {
     subsession_exists "$1" || return
-    _apply_tmux_opts "$1" "set-option" "tmux_subsession_${1}_"
+    _apply_tmux_opts "${SESSION_NAME}/$1" "set-option" "tmux_subsession_${1}_"
 }

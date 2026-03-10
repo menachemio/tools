@@ -35,6 +35,19 @@ source "$CORE_DIR/subsession-manager.sh"
 log() { [[ "$VERBOSE" == "true" ]] && echo ":: $*" >&2 || true; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# Validate a name (session or subsession) is safe for use as a tmux session name.
+# Rejects: empty, leading slash, dots (tmux silently converts to underscores),
+# colons (tmux target delimiter), spaces, and other control characters.
+validate_tmux_name() {
+    local name="$1" label="${2:-Name}"
+    [[ -z "$name" ]] && die "$label cannot be empty"
+    [[ "$name" == /* ]] && die "$label '$name' must not start with '/'"
+    [[ "$name" == *.* ]] && die "$label '$name' must not contain '.' (tmux converts dots to underscores). Use '-' or '_' instead"
+    [[ "$name" == *:* ]] && die "$label '$name' must not contain ':' (reserved by tmux target syntax)"
+    [[ "$name" =~ [[:space:]] ]] && die "$label '$name' must not contain whitespace"
+    return 0
+}
+
 # Wait for a tmux target to become ready (pane exists and is responsive).
 # Falls back to a short sleep if polling fails, with a bounded retry.
 wait_for_target() {
@@ -105,6 +118,13 @@ load_session_config() {
     if [[ -z "$SESSION_NAME" ]]; then
         die "Session name not defined in configuration"
     fi
+    validate_tmux_name "$SESSION_NAME" "Session name"
+
+    # Validate subsession names
+    while IFS= read -r _sub; do
+        [[ -z "$_sub" ]] && continue
+        validate_tmux_name "$_sub" "Subsession name"
+    done < <(yaml_get_subsessions)
 
     # Validate windows exist
     local window_list
@@ -308,7 +328,7 @@ create_tmux_config() {
     local opt_status_left_length="${YAML_VALUES["tmux_global_status-left-length"]:-50}"
     local opt_status_right_length="${YAML_VALUES["tmux_global_status-right-length"]:-100}"
     local opt_status_style="${YAML_VALUES["tmux_global_status-style"]:-bg=black,fg=white}"
-    local opt_status_left="${YAML_VALUES["tmux_global_status-left"]:- #S  }"
+    local opt_status_left="${YAML_VALUES["tmux_global_status-left"]:- #{s|.*/||:session_name}  }"
     local default_sr="${STATUS_RIGHT_CMD:-}"
     local opt_status_right="${YAML_VALUES["tmux_global_status-right"]:-$default_sr}"
     local opt_pane_border_style="${YAML_VALUES["tmux_global_pane-border-style"]:-fg=brightblack}"
@@ -467,7 +487,7 @@ _apply_color_defaults() {
         _tmux set-option -t "$target" status-style "fg=${color},bg=default" 2>/dev/null || true
     fi
     if [[ -z "$ov_left" ]]; then
-        _tmux set-option -t "$target" status-left "#[fg=${color},bold] #S #[default]" 2>/dev/null || true
+        _tmux set-option -t "$target" status-left "#[fg=${color},bold] #{s|.*/||:session_name} #[default]" 2>/dev/null || true
     fi
     # Lazy-init: ensure STATUS_RIGHT_CMD is set even if reached from
     # an isolated code path (e.g. refresh_subsession without full init)
@@ -703,7 +723,7 @@ start_session() {
     done
 
     # If session exists, just attach
-    if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if _tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
         log "Session $SESSION_NAME already exists"
         _tmux set-option -u window-size 2>/dev/null || true
         if [[ "$headless_mode" != "--headless" ]]; then
@@ -715,7 +735,7 @@ start_session() {
     fi
 
     log "Creating new session: $SESSION_NAME"
-    _tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+    _tmux kill-session -t "=$SESSION_NAME" 2>/dev/null || true
 
     # Resolve first window dir so new-session starts with the right cwd natively
     local first_win_dir
@@ -781,9 +801,9 @@ start_session() {
 
 # Stop session (keep subsessions)
 stop_session() {
-    if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if _tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
         log "Stopping main session: $SESSION_NAME"
-        _tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+        _tmux kill-session -t "=$SESSION_NAME" 2>/dev/null || true
 
         # Report remaining subsessions
         while IFS= read -r sub_name; do
@@ -801,7 +821,7 @@ stop_session() {
 
 # Show session status
 show_session_status() {
-    if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if _tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
         echo "Main session: $SESSION_NAME (running)"
         local windows
         windows=$(_tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" 2>/dev/null | tr '\n' ' ')
@@ -823,7 +843,7 @@ show_session_status() {
 
 # Refresh tmux settings for running session without restarting processes
 refresh_session() {
-    if ! _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if ! _tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
         die "Session '$SESSION_NAME' is not running"
     fi
 
@@ -882,7 +902,7 @@ refresh_session() {
 kill_all_sessions() {
     local sessions=()
 
-    if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if _tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
         sessions+=("$SESSION_NAME (main)")
     fi
 
@@ -914,14 +934,14 @@ kill_all_sessions() {
         [[ -z "$sub_name" ]] && continue
         if subsession_exists "$sub_name"; then
             log "Killing subsession: $sub_name"
-            _tmux kill-session -t "$sub_name" 2>/dev/null || true
+            stop_subsession "$sub_name"
         fi
     done < <(yaml_get_subsessions)
 
     # Kill main session
-    if _tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if _tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
         log "Killing main session: $SESSION_NAME"
-        _tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+        _tmux kill-session -t "=$SESSION_NAME" 2>/dev/null || true
     fi
 
     log "All sessions terminated"

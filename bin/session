@@ -89,6 +89,13 @@ install_session_command() {
     if [[ -z "$name" ]]; then
         die "No 'name' field found in $abs_config"
     fi
+    validate_tmux_name "$name" "Session name"
+
+    # Validate subsession names
+    while IFS= read -r _sub; do
+        [[ -z "$_sub" ]] && continue
+        validate_tmux_name "$_sub" "Subsession name"
+    done < <(yaml_get_subsessions)
 
     mkdir -p "$install_dir"
 
@@ -147,7 +154,7 @@ cmd_remove() {
     local target="$1"
     while IFS=$'\t' read -r name wrapper config; do
         if [[ "$name" == "$target" ]]; then
-            if _tmux has-session -t "$name" 2>/dev/null; then
+            if _tmux has-session -t "=$name" 2>/dev/null; then
                 echo "Warning: session '$name' is currently running" >&2
             fi
             rm "$wrapper"
@@ -318,7 +325,7 @@ main() {
                 if [[ "$HEADLESS_MODE" == true ]]; then
                     log "Subsession '$SUBSESSION_NAME' started in background"
                 else
-                    TMUX= exec tmux -L "$SM_SOCKET" attach-session -t "$SUBSESSION_NAME"
+                    TMUX= exec tmux -L "$SM_SOCKET" attach-session -t "${SESSION_NAME}/${SUBSESSION_NAME}"
                 fi
                 ;;
             stop)    stop_subsession "$SUBSESSION_NAME" ;;
